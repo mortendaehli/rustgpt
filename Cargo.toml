@@ -1,0 +1,8 @@
+[package]
+name = "rustgpt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pollster = "0.3"
+wgpu = "0.20"

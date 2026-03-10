@@ -1,0 +1,36 @@
+//! RustGPT is organized into a few teaching-oriented layers:
+//! `app` for CLI entrypoints, `core` for reusable primitives,
+//! `data` for corpora/tokenizers/checkpoints, `model` for transformer
+//! parameters, and `runtime` for forward/backward/training/sampling.
+
+pub mod app;
+pub mod core;
+pub mod data;
+pub mod model;
+pub mod runtime;
+
+use crate::core::error::Result;
+
+pub fn run<I>(args: I) -> Result<()>
+where
+    I: IntoIterator<Item = String>,
+{
+    match app::cli::parse_args(args)? {
+        app::cli::Command::Help(text) => {
+            println!("{text}");
+            Ok(())
+        }
+        app::cli::Command::Train(command) => app::commands::train::run_train(command),
+        app::cli::Command::BenchTrain(command) => app::commands::bench::run_bench_train(command),
+        app::cli::Command::BenchCompareTrain(command) => {
+            app::commands::bench::run_bench_compare_train(command)
+        }
+        app::cli::Command::InspectVocab(command) => {
+            app::commands::train::run_inspect_vocab(command)
+        }
+        app::cli::Command::Sample(command) => app::commands::sample::run_sample(command),
+        app::cli::Command::BenchSample(command) => app::commands::bench::run_bench_sample(command),
+        app::cli::Command::Chat(command) => app::commands::chat::run_chat(command),
+        app::cli::Command::GpuInfo(command) => runtime::backend::run_gpu_info(command),
+    }
+}

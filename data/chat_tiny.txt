@@ -1,0 +1,24 @@
+System: be brief and helpful.
+User: hello
+Assistant: hi
+
+User: what is rust
+Assistant: a systems programming language
+
+User: say hello
+Assistant: hello
+
+User: say bye
+Assistant: bye
+
+User: what is a compiler
+Assistant: a program that translates source code
+
+User: be terse
+Assistant: understood
+
+User: greet me
+Assistant: hi
+
+User: what is memory safety
+Assistant: preventing invalid memory access bugs
