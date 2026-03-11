@@ -8,14 +8,16 @@ use crate::app::cli::{
 use crate::core::config::{BenchmarkConfig, DeviceKind};
 use crate::core::error::Result;
 use crate::core::rng::Rng;
-use crate::engine::checkpoint::{load_inference_checkpoint, load_training_checkpoint};
-use crate::engine::device::{
-    CpuAutodiffBackend, CpuBackend, GpuAutodiffBackend, GpuBackend, ResolvedDeviceKind, cpu_device,
-    gpu_device,
+use crate::infer::sample::{SamplingStrategy, generate_sample};
+use crate::runtime::checkpoint::{load_inference_checkpoint, load_training_checkpoint};
+use crate::runtime::device::{
+    CpuAutodiffBackend, CpuBackend, CpuCheckpointAutodiffBackend, GpuAutodiffBackend, GpuBackend,
+    GpuCheckpointAutodiffBackend, ResolvedDeviceKind, cpu_device, gpu_device,
 };
-use crate::engine::generate::{SamplingStrategy, generate_sample};
-use crate::engine::profile::RuntimeProfile;
-use crate::engine::train::{TrainingArtifacts, prepare_training_run, run_training_steps};
+use crate::runtime::profile::RuntimeProfile;
+use crate::train::training::{
+    TrainingArtifacts, TrainingRunRequest, prepare_training_run, run_training_steps,
+};
 
 #[derive(Debug)]
 struct TrainBenchSummary {
@@ -33,39 +35,68 @@ impl TrainBenchSummary {
 
 pub fn run_bench_train(command: BenchTrainCommand) -> Result<()> {
     let resolved = ResolvedDeviceKind::resolve(command.train.train.device)?;
-    let summary = match resolved {
-        ResolvedDeviceKind::Cpu => bench_train_iterations::<CpuBackend, CpuAutodiffBackend>(
-            &command.train,
-            &command.bench,
-            cpu_device(),
-        )?,
-        ResolvedDeviceKind::Gpu => bench_train_iterations::<GpuBackend, GpuAutodiffBackend>(
-            &command.train,
-            &command.bench,
-            gpu_device(),
-        )?,
+    let summary = match (resolved, command.train.train.activation_checkpointing) {
+        (ResolvedDeviceKind::Cpu, false) => {
+            bench_train_iterations::<CpuBackend, CpuAutodiffBackend>(
+                &command.train,
+                &command.bench,
+                cpu_device(),
+            )?
+        }
+        (ResolvedDeviceKind::Cpu, true) => bench_train_iterations::<
+            CpuBackend,
+            CpuCheckpointAutodiffBackend,
+        >(&command.train, &command.bench, cpu_device())?,
+        (ResolvedDeviceKind::Gpu, false) => {
+            bench_train_iterations::<GpuBackend, GpuAutodiffBackend>(
+                &command.train,
+                &command.bench,
+                gpu_device(),
+            )?
+        }
+        (ResolvedDeviceKind::Gpu, true) => bench_train_iterations::<
+            GpuBackend,
+            GpuCheckpointAutodiffBackend,
+        >(&command.train, &command.bench, gpu_device())?,
     };
     print_bench_summary("train", &summary, &command.bench);
     Ok(())
 }
 
 pub fn run_bench_compare_train(command: BenchCompareTrainCommand) -> Result<()> {
-    let cpu_summary = bench_train_iterations::<CpuBackend, CpuAutodiffBackend>(
-        &command.train,
-        &command.bench,
-        cpu_device(),
-    )?;
-    let gpu_summary = bench_train_iterations::<GpuBackend, GpuAutodiffBackend>(
-        &TrainCommand {
-            train: crate::core::config::TrainConfig {
-                device: DeviceKind::Gpu,
-                ..command.train.train.clone()
-            },
-            ..command.train.clone()
+    let cpu_summary = if command.train.train.activation_checkpointing {
+        bench_train_iterations::<CpuBackend, CpuCheckpointAutodiffBackend>(
+            &command.train,
+            &command.bench,
+            cpu_device(),
+        )?
+    } else {
+        bench_train_iterations::<CpuBackend, CpuAutodiffBackend>(
+            &command.train,
+            &command.bench,
+            cpu_device(),
+        )?
+    };
+    let gpu_command = TrainCommand {
+        train: crate::core::config::TrainConfig {
+            device: DeviceKind::Gpu,
+            ..command.train.train.clone()
         },
-        &command.bench,
-        gpu_device(),
-    )?;
+        ..command.train.clone()
+    };
+    let gpu_summary = if gpu_command.train.activation_checkpointing {
+        bench_train_iterations::<GpuBackend, GpuCheckpointAutodiffBackend>(
+            &gpu_command,
+            &command.bench,
+            gpu_device(),
+        )?
+    } else {
+        bench_train_iterations::<GpuBackend, GpuAutodiffBackend>(
+            &gpu_command,
+            &command.bench,
+            gpu_device(),
+        )?
+    };
 
     println!("RustGPT benchmark  mode=train-compare");
     println!(
@@ -174,15 +205,17 @@ where
         let started_at = Instant::now();
         let _summary = run_training_steps::<B, AD>(
             artifacts,
-            &prepared.tokenizer,
-            &prepared.training_data,
-            &command.train,
-            prepared.starting_step,
-            &device,
-            Some(&profile),
-            false,
-            prepared.validation_data.as_ref(),
-            None,
+            TrainingRunRequest {
+                tokenizer: &prepared.tokenizer,
+                training_data: &prepared.training_data,
+                train_config: &command.train,
+                starting_step: prepared.starting_step,
+                device: &device,
+                profile: Some(&profile),
+                capture_logs: false,
+                validation_data: prepared.validation_data.as_ref(),
+                on_validation: None,
+            },
         )?;
         let elapsed = started_at.elapsed();
         if bench_idx >= bench.warmup {

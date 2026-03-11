@@ -1,5 +1,5 @@
 //! Data loading and serialization:
-//! corpora, tokenization, and checkpoints.
+//! corpora, tokenization, and training examples.
 
 pub mod corpus;
 pub mod eval_suite;

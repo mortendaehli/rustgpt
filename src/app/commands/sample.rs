@@ -3,10 +3,10 @@ use burn::tensor::backend::Backend;
 use crate::app::cli::SampleCommand;
 use crate::core::error::Result;
 use crate::core::rng::Rng;
-use crate::engine::checkpoint::load_inference_checkpoint;
-use crate::engine::device::{CpuBackend, GpuBackend, ResolvedDeviceKind, cpu_device, gpu_device};
-use crate::engine::generate::{SamplingStrategy, generate_sample};
-use crate::engine::profile::RuntimeProfile;
+use crate::infer::sample::{SamplingStrategy, generate_sample};
+use crate::runtime::checkpoint::load_inference_checkpoint;
+use crate::runtime::device::{CpuBackend, GpuBackend, ResolvedDeviceKind, cpu_device, gpu_device};
+use crate::runtime::profile::RuntimeProfile;
 
 pub fn run_sample(command: SampleCommand) -> Result<()> {
     let resolved = ResolvedDeviceKind::resolve(command.sample.device)?;
@@ -63,11 +63,11 @@ fn run_sample_impl<B: Backend>(
         println!("sample {:>2}: {}", sample_idx + 1, sample);
     }
 
-    if let Some(runtime_profile) = runtime_profile.as_ref() {
-        if !runtime_profile.is_empty() {
-            println!("stage timings:");
-            println!("{}", runtime_profile.format_table());
-        }
+    if let Some(runtime_profile) = runtime_profile.as_ref()
+        && !runtime_profile.is_empty()
+    {
+        println!("stage timings:");
+        println!("{}", runtime_profile.format_table());
     }
 
     Ok(())

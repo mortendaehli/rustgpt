@@ -1,5 +1,4 @@
 use burn::module::{Ignored, Module};
-use burn::nn::attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig};
 use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::optim::adaptor::OptimizerAdaptor;
 use burn::optim::{AdamW, AdamWConfig, grad_clipping::GradientClippingConfig};
@@ -16,7 +15,7 @@ pub type LanguageModelOptimizer<AD> = OptimizerAdaptor<AdamW, LanguageModel<AD>,
 pub struct LanguageModel<B: Backend> {
     cfg: Ignored<ModelConfig>,
     token_embedding: Embedding<B>,
-    position_embedding: Embedding<B>,
+    position_embedding: Option<Embedding<B>>,
     blocks: Vec<DecoderBlock<B>>,
     final_norm: RmsNorm<B>,
     lm_head: Option<Linear<B>>,
@@ -24,13 +23,14 @@ pub struct LanguageModel<B: Backend> {
 
 #[derive(Module, Debug)]
 struct DecoderBlock<B: Backend> {
-    attention: MultiHeadAttention<B>,
+    attention: SelfAttention<B>,
     norm_attn: RmsNorm<B>,
     norm_ff: RmsNorm<B>,
     ff_inner: Linear<B>,
     ff_gate: Option<Linear<B>>,
     ff_outer: Linear<B>,
     activation: Ignored<ActivationKind>,
+    position_encoding: Ignored<PositionEncodingKind>,
 }
 
 pub struct DecodeCache<B: Backend> {
@@ -45,6 +45,21 @@ struct DecoderBlockCache<B: Backend> {
 struct AttentionKvCache<B: Backend> {
     key: Option<Tensor<B, 4>>,
     value: Option<Tensor<B, 4>>,
+    len: usize,
+}
+
+#[derive(Module, Debug)]
+struct SelfAttention<B: Backend> {
+    query: Linear<B>,
+    key: Linear<B>,
+    value: Linear<B>,
+    output: Linear<B>,
+    d_model: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    d_k: usize,
+    min_float: f64,
+    quiet_softmax: bool,
 }
 
 impl<B: Backend> LanguageModel<B> {
@@ -53,7 +68,9 @@ impl<B: Backend> LanguageModel<B> {
 
         let ff_hidden = cfg.n_embd * 4;
         let token_embedding = EmbeddingConfig::new(cfg.vocab_size, cfg.n_embd).init(device);
-        let position_embedding = EmbeddingConfig::new(cfg.block_size, cfg.n_embd).init(device);
+        let position_embedding =
+            matches!(cfg.position_encoding, PositionEncodingKind::LearnedAbsolute)
+                .then(|| EmbeddingConfig::new(cfg.block_size, cfg.n_embd).init(device));
         let blocks = (0..cfg.n_layer)
             .map(|_| DecoderBlock::new(&cfg, ff_hidden, device))
             .collect();
@@ -96,9 +113,7 @@ impl<B: Backend> LanguageModel<B> {
         pad_mask: Option<Tensor<B, 2, Bool>>,
     ) -> Tensor<B, 3> {
         let [batch_size, seq_length] = input_ids.dims();
-        let position_ids = position_ids_tensor::<B>(batch_size, seq_length, &input_ids.device());
-        let mut hidden =
-            self.token_embedding.forward(input_ids) + self.position_embedding.forward(position_ids);
+        let mut hidden = self.input_embeddings(input_ids, batch_size, seq_length, 0);
         let attn_mask =
             Tensor::<B, 2, Bool>::tril_mask([seq_length, seq_length], 0, &hidden.device())
                 .expand([batch_size, seq_length, seq_length]);
@@ -124,9 +139,7 @@ impl<B: Backend> LanguageModel<B> {
             .collect::<Vec<_>>();
         let seq_length = token_ids.len();
         let input_ids = int_tensor_2d::<B>(&values, 1, seq_length, &device);
-        let position_ids = position_ids_tensor_with_offset::<B>(1, seq_length, 0, &device);
-        let mut hidden =
-            self.token_embedding.forward(input_ids) + self.position_embedding.forward(position_ids);
+        let mut hidden = self.input_embeddings(input_ids, 1, seq_length, 0);
         let attn_mask = causal_mask::<B>(1, seq_length, &hidden.device());
 
         for (block, layer_cache) in self.blocks.iter().zip(cache.layers.iter_mut()) {
@@ -150,9 +163,7 @@ impl<B: Backend> LanguageModel<B> {
 
         let device = self.device();
         let input_ids = int_tensor_2d::<B>(&[token_id as i64], 1, 1, &device);
-        let position_ids = position_ids_tensor_with_offset::<B>(1, 1, position, &device);
-        let mut hidden =
-            self.token_embedding.forward(input_ids) + self.position_embedding.forward(position_ids);
+        let mut hidden = self.input_embeddings(input_ids, 1, 1, position);
 
         for (block, layer_cache) in self.blocks.iter().zip(cache.layers.iter_mut()) {
             hidden = block.forward_decode_step(hidden, layer_cache);
@@ -193,13 +204,33 @@ impl<B: Backend> LanguageModel<B> {
             .next()
             .expect("language model must own a device")
     }
+
+    fn input_embeddings(
+        &self,
+        input_ids: Tensor<B, 2, Int>,
+        batch_size: usize,
+        seq_length: usize,
+        offset: usize,
+    ) -> Tensor<B, 3> {
+        let token_embeddings = self.token_embedding.forward(input_ids);
+        match &self.position_embedding {
+            Some(position_embedding) => {
+                let position_ids = position_ids_tensor_with_offset::<B>(
+                    batch_size,
+                    seq_length,
+                    offset,
+                    &token_embeddings.device(),
+                );
+                token_embeddings + position_embedding.forward(position_ids)
+            }
+            None => token_embeddings,
+        }
+    }
 }
 
 impl<B: Backend> DecoderBlock<B> {
     fn new(cfg: &ModelConfig, ff_hidden: usize, device: &B::Device) -> Self {
-        let attention = MultiHeadAttentionConfig::new(cfg.n_embd, cfg.n_head)
-            .with_dropout(0.0)
-            .init(device);
+        let attention = SelfAttention::new(cfg, device);
         let norm_attn = RmsNormConfig::new(cfg.n_embd).init(device);
         let norm_ff = RmsNormConfig::new(cfg.n_embd).init(device);
         let ff_inner = LinearConfig::new(cfg.n_embd, ff_hidden).init(device);
@@ -215,6 +246,7 @@ impl<B: Backend> DecoderBlock<B> {
             ff_gate,
             ff_outer,
             activation: Ignored(cfg.activation),
+            position_encoding: Ignored(cfg.position_encoding),
         }
     }
 
@@ -225,14 +257,7 @@ impl<B: Backend> DecoderBlock<B> {
         attn_mask: Tensor<B, 3, Bool>,
     ) -> Tensor<B, 3> {
         let residual = input.clone();
-        let mut attn_input = MhaInput::self_attn(self.norm_attn.forward(input));
-        if let Some(pad_mask) = pad_mask {
-            attn_input = attn_input.mask_pad(pad_mask);
-        }
-        let attn = self
-            .attention
-            .forward(attn_input.mask_attn(attn_mask))
-            .context;
+        let attn = self.self_attention_full(self.norm_attn.forward(input), pad_mask, attn_mask);
         let hidden = residual + attn;
         let residual = hidden.clone();
         residual + self.feed_forward(self.norm_ff.forward(hidden))
@@ -280,6 +305,36 @@ impl<B: Backend> DecoderBlock<B> {
         self.ff_outer.forward(activated)
     }
 
+    fn self_attention_full(
+        &self,
+        input: Tensor<B, 3>,
+        pad_mask: Option<Tensor<B, 2, Bool>>,
+        attn_mask: Tensor<B, 3, Bool>,
+    ) -> Tensor<B, 3> {
+        let [batch_size, seq_length, _d_model] = input.dims();
+        let query = self.attention.project_query(input.clone());
+        let key = self.attention.project_key(input.clone());
+        let value = self.attention.project_value(input);
+        let (query, key) = self.apply_position_encoding(query, key, 0);
+        let key = self.attention.expand_kv_heads(key);
+        let value = self.attention.expand_kv_heads(value);
+
+        let mut attn_scores = self.attention.attention_scores(query, key).mask_fill(
+            attn_mask.reshape([batch_size, 1, seq_length, seq_length]),
+            self.attention.min_float,
+        );
+        if let Some(pad_mask) = pad_mask {
+            let key_pad_mask = pad_mask
+                .reshape([batch_size, 1, 1, seq_length])
+                .expand([batch_size, 1, seq_length, seq_length]);
+            attn_scores = attn_scores.mask_fill(key_pad_mask, self.attention.min_float);
+        }
+        let weights = self.attention.attention_weights(attn_scores);
+        let context = weights.matmul(value);
+        self.attention
+            .project_attention_context(context, batch_size, seq_length)
+    }
+
     fn self_attention_prefill(
         &self,
         input: Tensor<B, 3>,
@@ -287,18 +342,22 @@ impl<B: Backend> DecoderBlock<B> {
         cache: &mut DecoderBlockCache<B>,
     ) -> Tensor<B, 3> {
         let [batch_size, seq_length, _d_model] = input.dims();
-        let query = self.attention_linear(input.clone(), &self.attention.query);
-        let key = self.attention_linear(input.clone(), &self.attention.key);
-        let value = self.attention_linear(input, &self.attention.value);
+        let query = self.attention.project_query(input.clone());
+        let key = self.attention.project_key(input.clone());
+        let value = self.attention.project_value(input);
+        let (query, key) = self.apply_position_encoding(query, key, 0);
         cache.attention.set(key.clone(), value.clone());
+        let key = self.attention.expand_kv_heads(key);
+        let value = self.attention.expand_kv_heads(value);
 
-        let attn_scores = self.attention_scores(query, key).mask_fill(
+        let attn_scores = self.attention.attention_scores(query, key).mask_fill(
             attn_mask.reshape([batch_size, 1, seq_length, seq_length]),
             self.attention.min_float,
         );
-        let weights = self.attention_weights(attn_scores);
+        let weights = self.attention.attention_weights(attn_scores);
         let context = weights.clone().matmul(value);
-        self.project_attention_context(context, batch_size, seq_length)
+        self.attention
+            .project_attention_context(context, batch_size, seq_length)
     }
 
     fn self_attention_decode_step(
@@ -306,38 +365,102 @@ impl<B: Backend> DecoderBlock<B> {
         input: Tensor<B, 3>,
         cache: &mut DecoderBlockCache<B>,
     ) -> Tensor<B, 3> {
-        let query = self.attention_linear(input.clone(), &self.attention.query);
-        let key = self.attention_linear(input.clone(), &self.attention.key);
-        let value = self.attention_linear(input, &self.attention.value);
+        let position = cache.attention.len;
+        let query = self.attention.project_query(input.clone());
+        let key = self.attention.project_key(input.clone());
+        let value = self.attention.project_value(input);
+        let (query, key) = self.apply_position_encoding(query, key, position);
         let (key, value) = cache.attention.append(key, value);
+        let key = self.attention.expand_kv_heads(key);
+        let value = self.attention.expand_kv_heads(value);
 
-        let weights = self.attention_weights(self.attention_scores(query, key));
+        let weights = self
+            .attention
+            .attention_weights(self.attention.attention_scores(query, key));
         let context = weights.matmul(value);
-        self.project_attention_context(context, 1, 1)
+        self.attention.project_attention_context(context, 1, 1)
     }
 
-    fn attention_linear(&self, input: Tensor<B, 3>, linear: &Linear<B>) -> Tensor<B, 4> {
+    fn apply_position_encoding(
+        &self,
+        query: Tensor<B, 4>,
+        key: Tensor<B, 4>,
+        start_position: usize,
+    ) -> (Tensor<B, 4>, Tensor<B, 4>) {
+        match *self.position_encoding {
+            PositionEncodingKind::LearnedAbsolute => (query, key),
+            PositionEncodingKind::Rope => (
+                apply_rotary_embedding(query, start_position),
+                apply_rotary_embedding(key, start_position),
+            ),
+        }
+    }
+}
+
+impl<B: Backend> SelfAttention<B> {
+    fn new(cfg: &ModelConfig, device: &B::Device) -> Self {
+        let d_k = cfg.n_embd / cfg.n_head;
+
+        Self {
+            query: LinearConfig::new(cfg.n_embd, cfg.n_head * d_k).init(device),
+            key: LinearConfig::new(cfg.n_embd, cfg.n_kv_head * d_k).init(device),
+            value: LinearConfig::new(cfg.n_embd, cfg.n_kv_head * d_k).init(device),
+            output: LinearConfig::new(cfg.n_embd, cfg.n_embd).init(device),
+            d_model: cfg.n_embd,
+            n_heads: cfg.n_head,
+            n_kv_heads: cfg.n_kv_head,
+            d_k,
+            min_float: -1.0e4,
+            quiet_softmax: false,
+        }
+    }
+
+    fn project_query(&self, input: Tensor<B, 3>) -> Tensor<B, 4> {
+        self.project_heads(input, &self.query, self.n_heads)
+    }
+
+    fn project_key(&self, input: Tensor<B, 3>) -> Tensor<B, 4> {
+        self.project_heads(input, &self.key, self.n_kv_heads)
+    }
+
+    fn project_value(&self, input: Tensor<B, 3>) -> Tensor<B, 4> {
+        self.project_heads(input, &self.value, self.n_kv_heads)
+    }
+
+    fn project_heads(&self, input: Tensor<B, 3>, linear: &Linear<B>, heads: usize) -> Tensor<B, 4> {
         let [batch_size, seq_length, _d_model] = input.dims();
         linear
             .forward(input)
-            .reshape([
-                batch_size,
-                seq_length,
-                self.attention.n_heads,
-                self.attention.d_k,
-            ])
+            .reshape([batch_size, seq_length, heads, self.d_k])
             .swap_dims(1, 2)
     }
 
+    fn expand_kv_heads(&self, tensor: Tensor<B, 4>) -> Tensor<B, 4> {
+        if self.n_kv_heads == self.n_heads {
+            return tensor;
+        }
+
+        let [batch_size, n_kv_heads, seq_length, head_dim] = tensor.dims();
+        let groups_per_kv_head = self.n_heads / self.n_kv_heads;
+        tensor
+            .unsqueeze_dim::<5>(2)
+            .repeat_dim(2, groups_per_kv_head)
+            .reshape([
+                batch_size,
+                n_kv_heads * groups_per_kv_head,
+                seq_length,
+                head_dim,
+            ])
+    }
+
     fn attention_scores(&self, query: Tensor<B, 4>, key: Tensor<B, 4>) -> Tensor<B, 4> {
-        let scores = query
+        query
             .matmul(key.transpose())
-            .div_scalar((self.attention.d_k as f32).sqrt());
-        self.attention.dropout.forward(scores)
+            .div_scalar((self.d_k as f32).sqrt())
     }
 
     fn attention_weights(&self, attn_scores: Tensor<B, 4>) -> Tensor<B, 4> {
-        if self.attention.quiet_softmax {
+        if self.quiet_softmax {
             quiet_softmax(attn_scores, 3)
         } else {
             softmax(attn_scores, 3)
@@ -350,13 +473,11 @@ impl<B: Backend> DecoderBlock<B> {
         batch_size: usize,
         seq_length: usize,
     ) -> Tensor<B, 3> {
-        self.attention
-            .output
-            .forward(context.swap_dims(1, 2).reshape([
-                batch_size,
-                seq_length,
-                self.attention.d_model,
-            ]))
+        self.output.forward(
+            context
+                .swap_dims(1, 2)
+                .reshape([batch_size, seq_length, self.d_model]),
+        )
     }
 }
 
@@ -382,15 +503,18 @@ impl<B: Backend> AttentionKvCache<B> {
         Self {
             key: None,
             value: None,
+            len: 0,
         }
     }
 
     fn clear(&mut self) {
         self.key = None;
         self.value = None;
+        self.len = 0;
     }
 
     fn set(&mut self, key: Tensor<B, 4>, value: Tensor<B, 4>) {
+        self.len = key.dims()[2];
         self.key = Some(key);
         self.value = Some(value);
     }
@@ -404,6 +528,7 @@ impl<B: Backend> AttentionKvCache<B> {
             Some(cache) => Tensor::cat(vec![cache, value], 2),
             None => value,
         };
+        self.len = key.dims()[2];
         self.key = Some(key.clone());
         self.value = Some(value.clone());
         (key, value)
@@ -416,26 +541,33 @@ pub fn validate_model_config(cfg: &ModelConfig) -> Result<()> {
             "block_size must be at least 1".to_string(),
         ));
     }
-    if cfg.n_layer == 0 || cfg.n_embd == 0 || cfg.n_head == 0 {
+    if cfg.n_layer == 0 || cfg.n_embd == 0 || cfg.n_head == 0 || cfg.n_kv_head == 0 {
         return Err(RustGptError::Config(
-            "n_layer, n_embd, and n_head must all be at least 1".to_string(),
+            "n_layer, n_embd, n_head, and n_kv_head must all be at least 1".to_string(),
         ));
     }
-    if cfg.n_embd % cfg.n_head != 0 {
+    if !cfg.n_embd.is_multiple_of(cfg.n_head) {
         return Err(RustGptError::Config(format!(
             "n_embd ({}) must be divisible by n_head ({})",
             cfg.n_embd, cfg.n_head
         )));
     }
-    if cfg.n_kv_head != cfg.n_head {
+    if cfg.n_kv_head > cfg.n_head {
         return Err(RustGptError::Config(
-            "Burn migration currently supports only n_kv_head == n_head".to_string(),
+            "n_kv_head must be less than or equal to n_head".to_string(),
         ));
     }
-    if cfg.position_encoding != PositionEncodingKind::LearnedAbsolute {
+    if !cfg.n_head.is_multiple_of(cfg.n_kv_head) {
+        return Err(RustGptError::Config(format!(
+            "n_head ({}) must be divisible by n_kv_head ({})",
+            cfg.n_head, cfg.n_kv_head
+        )));
+    }
+    if matches!(cfg.position_encoding, PositionEncodingKind::Rope)
+        && !(cfg.n_embd / cfg.n_head).is_multiple_of(2)
+    {
         return Err(RustGptError::Config(
-            "Burn migration currently supports only learned absolute position embeddings"
-                .to_string(),
+            "RoPE requires an even attention head dimension".to_string(),
         ));
     }
 
@@ -466,14 +598,6 @@ pub fn build_optimizer<AD: AutodiffBackend>(
     config.init::<AD, LanguageModel<AD>>()
 }
 
-fn position_ids_tensor<B: Backend>(
-    batch_size: usize,
-    seq_length: usize,
-    device: &B::Device,
-) -> Tensor<B, 2, Int> {
-    position_ids_tensor_with_offset::<B>(batch_size, seq_length, 0, device)
-}
-
 fn position_ids_tensor_with_offset<B: Backend>(
     batch_size: usize,
     seq_length: usize,
@@ -484,6 +608,62 @@ fn position_ids_tensor_with_offset<B: Backend>(
         .flat_map(|_| (0..seq_length).map(move |position| (offset + position) as i64))
         .collect::<Vec<_>>();
     int_tensor_2d::<B>(&values, batch_size, seq_length, device)
+}
+
+fn apply_rotary_embedding<B: Backend>(tensor: Tensor<B, 4>, start_position: usize) -> Tensor<B, 4> {
+    let [batch_size, heads, seq_length, head_dim] = tensor.dims();
+    let half_dim = head_dim / 2;
+    let (cos, sin) = rotary_tables::<B>(seq_length, half_dim, start_position, &tensor.device());
+    let pairs = tensor.reshape([batch_size, heads, seq_length, half_dim, 2]);
+    let even = pairs
+        .clone()
+        .slice([0..batch_size, 0..heads, 0..seq_length, 0..half_dim, 0..1])
+        .reshape([batch_size, heads, seq_length, half_dim]);
+    let odd = pairs
+        .slice([0..batch_size, 0..heads, 0..seq_length, 0..half_dim, 1..2])
+        .reshape([batch_size, heads, seq_length, half_dim]);
+
+    let rotated_even = even.clone() * cos.clone() - odd.clone() * sin.clone();
+    let rotated_odd = even * sin + odd * cos;
+    Tensor::cat(
+        vec![
+            rotated_even.unsqueeze_dim::<5>(4),
+            rotated_odd.unsqueeze_dim::<5>(4),
+        ],
+        4,
+    )
+    .reshape([batch_size, heads, seq_length, head_dim])
+}
+
+fn rotary_tables<B: Backend>(
+    seq_length: usize,
+    half_dim: usize,
+    start_position: usize,
+    device: &B::Device,
+) -> (Tensor<B, 4>, Tensor<B, 4>) {
+    let mut cos_values = Vec::with_capacity(seq_length * half_dim);
+    let mut sin_values = Vec::with_capacity(seq_length * half_dim);
+
+    for position in 0..seq_length {
+        let absolute_position = (start_position + position) as f32;
+        for idx in 0..half_dim {
+            let theta =
+                absolute_position / 10000_f32.powf((2 * idx) as f32 / (2 * half_dim) as f32);
+            cos_values.push(theta.cos());
+            sin_values.push(theta.sin());
+        }
+    }
+
+    (
+        Tensor::<B, 4>::from_data(
+            TensorData::new(cos_values, [1, 1, seq_length, half_dim]),
+            device,
+        ),
+        Tensor::<B, 4>::from_data(
+            TensorData::new(sin_values, [1, 1, seq_length, half_dim]),
+            device,
+        ),
+    )
 }
 
 fn causal_mask<B: Backend>(
@@ -531,41 +711,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn validates_supported_configs() {
-        validate_model_config(&test_config()).unwrap();
+    fn rope_config() -> ModelConfig {
+        ModelConfig {
+            position_encoding: PositionEncodingKind::Rope,
+            ..test_config()
+        }
     }
 
-    #[test]
-    fn forward_preserves_expected_shape() {
-        let cfg = test_config();
-        let device = Default::default();
-        let model = LanguageModel::<TestBackend>::new(cfg.clone(), &device).unwrap();
-        let input = Tensor::<TestBackend, 2, Int>::from_data(
-            TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
-            &device,
-        );
-        let logits = model.forward(input, None);
-        assert_eq!(logits.dims(), [1, 4, cfg.vocab_size]);
+    fn gqa_config() -> ModelConfig {
+        ModelConfig {
+            n_kv_head: 2,
+            ..rope_config()
+        }
     }
 
-    #[test]
-    fn forward_step_keeps_single_token_shape_across_cached_steps() {
-        let cfg = test_config();
-        let device = Default::default();
-        let model = LanguageModel::<TestBackend>::new(cfg.clone(), &device).unwrap();
-        let mut cache = model.new_decode_cache();
-
-        let logits_1 = model.forward_step(1, 0, &mut cache);
-        let logits_2 = model.forward_step(2, 1, &mut cache);
-
-        assert_eq!(logits_1.dims(), [cfg.vocab_size]);
-        assert_eq!(logits_2.dims(), [cfg.vocab_size]);
-    }
-
-    #[test]
-    fn prefill_and_decode_match_full_forward() {
-        let cfg = test_config();
+    fn assert_prefill_and_decode_match_full_forward(cfg: ModelConfig) {
         let device = Default::default();
         TestBackend::seed(&device, 7);
         let model = LanguageModel::<TestBackend>::new(cfg.clone(), &device).unwrap();
@@ -604,5 +764,87 @@ mod tests {
             .reshape([cfg.vocab_size])
             .into_data()
             .assert_approx_eq::<f32>(&decode_logits_2.into_data(), Tolerance::default());
+    }
+
+    #[test]
+    fn validates_supported_configs() {
+        validate_model_config(&test_config()).unwrap();
+    }
+
+    #[test]
+    fn validates_rope_configs() {
+        validate_model_config(&rope_config()).unwrap();
+    }
+
+    #[test]
+    fn validates_grouped_query_attention_configs() {
+        validate_model_config(&gqa_config()).unwrap();
+    }
+
+    #[test]
+    fn rejects_non_divisible_grouped_query_attention_configs() {
+        let err = validate_model_config(&ModelConfig {
+            n_embd: 24,
+            n_head: 6,
+            n_kv_head: 4,
+            ..test_config()
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "n_head (6) must be divisible by n_kv_head (4)"
+        );
+    }
+
+    #[test]
+    fn forward_preserves_expected_shape() {
+        let cfg = test_config();
+        let device = Default::default();
+        let model = LanguageModel::<TestBackend>::new(cfg.clone(), &device).unwrap();
+        let input = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+            &device,
+        );
+        let logits = model.forward(input, None);
+        assert_eq!(logits.dims(), [1, 4, cfg.vocab_size]);
+    }
+
+    #[test]
+    fn forward_step_keeps_single_token_shape_across_cached_steps() {
+        let cfg = test_config();
+        let device = Default::default();
+        let model = LanguageModel::<TestBackend>::new(cfg.clone(), &device).unwrap();
+        let mut cache = model.new_decode_cache();
+
+        let logits_1 = model.forward_step(1, 0, &mut cache);
+        let logits_2 = model.forward_step(2, 1, &mut cache);
+
+        assert_eq!(logits_1.dims(), [cfg.vocab_size]);
+        assert_eq!(logits_2.dims(), [cfg.vocab_size]);
+    }
+
+    #[test]
+    fn prefill_and_decode_match_full_forward() {
+        assert_prefill_and_decode_match_full_forward(test_config());
+    }
+
+    #[test]
+    fn rope_prefill_and_decode_match_full_forward() {
+        assert_prefill_and_decode_match_full_forward(rope_config());
+    }
+
+    #[test]
+    fn gqa_prefill_and_decode_match_full_forward() {
+        assert_prefill_and_decode_match_full_forward(gqa_config());
+    }
+
+    #[test]
+    fn gqa_uses_fewer_parameters_than_full_multi_head_attention() {
+        let device = Default::default();
+        let full = LanguageModel::<TestBackend>::new(rope_config(), &device).unwrap();
+        let grouped = LanguageModel::<TestBackend>::new(gqa_config(), &device).unwrap();
+
+        assert!(grouped.num_parameters() < full.num_parameters());
     }
 }

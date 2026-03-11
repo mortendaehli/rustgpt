@@ -4,10 +4,9 @@ use burn::tensor::backend::Backend;
 
 use crate::core::error::{Result, RustGptError};
 use crate::core::rng::Rng;
-use crate::core::tensor::softmax;
 use crate::data::tokenizer::Tokenizer;
-use crate::engine::model::LanguageModel;
-use crate::engine::profile::{RuntimeProfile, measure};
+use crate::model::lm::LanguageModel;
+use crate::runtime::profile::{RuntimeProfile, measure};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StopCondition {
@@ -30,21 +29,6 @@ impl StopCondition {
         }
     }
 
-    pub fn from_strings(tokenizer: &Tokenizer, stop_sequences: &[String]) -> Self {
-        Self {
-            token_sequences: stop_sequences
-                .iter()
-                .filter(|sequence| !sequence.is_empty())
-                .map(|sequence| tokenizer.encode_text(sequence))
-                .filter(|sequence| !sequence.is_empty())
-                .collect(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.token_sequences.is_empty()
-    }
-
     pub fn matched_suffix_len(&self, generated_tokens: &[usize]) -> Option<usize> {
         self.token_sequences.iter().find_map(|sequence| {
             generated_tokens
@@ -65,17 +49,6 @@ pub struct SamplingStrategy {
 }
 
 impl SamplingStrategy {
-    pub fn temperature_only(temperature: f32) -> Self {
-        Self {
-            temperature,
-            top_k: 0,
-            top_p: 1.0,
-            repetition_penalty: 1.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-        }
-    }
-
     pub fn validate(&self) -> Result<()> {
         if self.temperature <= 0.0 {
             return Err(RustGptError::Config("temperature must be > 0".to_string()));
@@ -92,6 +65,13 @@ impl SamplingStrategy {
     }
 }
 
+pub struct GenerationConfig<'a> {
+    pub max_new_tokens: usize,
+    pub strategy: &'a SamplingStrategy,
+    pub stop_condition: &'a StopCondition,
+    pub profile: Option<&'a RuntimeProfile>,
+}
+
 pub fn generate_sample<B: Backend>(
     model: &LanguageModel<B>,
     tokenizer: &Tokenizer,
@@ -101,16 +81,14 @@ pub fn generate_sample<B: Backend>(
     profile: Option<&RuntimeProfile>,
     rng: &mut Rng,
 ) -> Result<String> {
-    let completion = generate_completion(
-        model,
-        tokenizer,
-        prompt,
+    let stop_condition = StopCondition::none();
+    let config = GenerationConfig {
         max_new_tokens,
         strategy,
-        &StopCondition::none(),
+        stop_condition: &stop_condition,
         profile,
-        rng,
-    )?;
+    };
+    let completion = generate_completion(model, tokenizer, prompt, &config, rng)?;
     Ok(format!("{prompt}{completion}"))
 }
 
@@ -118,20 +96,14 @@ pub fn generate_completion<B: Backend>(
     model: &LanguageModel<B>,
     tokenizer: &Tokenizer,
     prompt: &str,
-    max_new_tokens: usize,
-    strategy: &SamplingStrategy,
-    stop_condition: &StopCondition,
-    profile: Option<&RuntimeProfile>,
+    config: &GenerationConfig<'_>,
     rng: &mut Rng,
 ) -> Result<String> {
     generate_completion_inner(
         model,
         tokenizer,
         tokenizer.encode_text(prompt),
-        max_new_tokens,
-        strategy,
-        stop_condition,
-        profile,
+        config,
         rng,
         None,
     )
@@ -141,33 +113,17 @@ pub fn generate_completion_from_tokens<B: Backend>(
     model: &LanguageModel<B>,
     tokenizer: &Tokenizer,
     prompt_tokens: &[usize],
-    max_new_tokens: usize,
-    strategy: &SamplingStrategy,
-    stop_condition: &StopCondition,
-    profile: Option<&RuntimeProfile>,
+    config: &GenerationConfig<'_>,
     rng: &mut Rng,
 ) -> Result<String> {
-    generate_completion_inner(
-        model,
-        tokenizer,
-        prompt_tokens.to_vec(),
-        max_new_tokens,
-        strategy,
-        stop_condition,
-        profile,
-        rng,
-        None,
-    )
+    generate_completion_inner(model, tokenizer, prompt_tokens.to_vec(), config, rng, None)
 }
 
 pub fn generate_completion_streaming<B: Backend>(
     model: &LanguageModel<B>,
     tokenizer: &Tokenizer,
     prompt_tokens: &[usize],
-    max_new_tokens: usize,
-    strategy: &SamplingStrategy,
-    stop_condition: &StopCondition,
-    profile: Option<&RuntimeProfile>,
+    config: &GenerationConfig<'_>,
     rng: &mut Rng,
     on_text: &mut dyn FnMut(&str),
 ) -> Result<String> {
@@ -175,10 +131,7 @@ pub fn generate_completion_streaming<B: Backend>(
         model,
         tokenizer,
         prompt_tokens.to_vec(),
-        max_new_tokens,
-        strategy,
-        stop_condition,
-        profile,
+        config,
         rng,
         Some(on_text),
     )
@@ -188,34 +141,32 @@ fn generate_completion_inner<B: Backend>(
     model: &LanguageModel<B>,
     tokenizer: &Tokenizer,
     prompt_tokens: Vec<usize>,
-    max_new_tokens: usize,
-    strategy: &SamplingStrategy,
-    stop_condition: &StopCondition,
-    profile: Option<&RuntimeProfile>,
+    config: &GenerationConfig<'_>,
     rng: &mut Rng,
     mut on_text: Option<&mut dyn FnMut(&str)>,
 ) -> Result<String> {
-    strategy.validate()?;
+    config.strategy.validate()?;
 
     let conditioning =
-        conditioning_from_prompt_tokens(model, tokenizer, &prompt_tokens, max_new_tokens);
+        conditioning_from_prompt_tokens(model, tokenizer, &prompt_tokens, config.max_new_tokens);
     let mut seen_token_counts = HashMap::new();
     for token_id in &conditioning {
         *seen_token_counts.entry(*token_id).or_insert(0_usize) += 1;
     }
 
     let mut cache = model.new_decode_cache();
-    let mut logits = measure(profile, "sample.prefill", || {
+    let mut logits = measure(config.profile, "sample.prefill", || {
         model.prefill(&conditioning, &mut cache)
     });
-    let max_steps =
-        max_new_tokens.min(model.config().block_size.saturating_sub(conditioning.len()));
+    let max_steps = config
+        .max_new_tokens
+        .min(model.config().block_size.saturating_sub(conditioning.len()));
     let mut generated_tokens = Vec::with_capacity(max_steps);
     let mut emitted_len = 0;
 
     for step in 0..max_steps {
-        let next_token = measure(profile, "sample.select_token", || {
-            select_next_token_from_tensor(&logits, strategy, &seen_token_counts, rng)
+        let next_token = measure(config.profile, "sample.select_token", || {
+            select_next_token_from_tensor(&logits, config.strategy, &seen_token_counts, rng)
         })?;
         if tokenizer.is_end_token(next_token) {
             break;
@@ -225,7 +176,7 @@ fn generate_completion_inner<B: Backend>(
         *seen_token_counts.entry(next_token).or_insert(0_usize) += 1;
 
         let visible_token_count =
-            if let Some(stop_len) = stop_condition.matched_suffix_len(&generated_tokens) {
+            if let Some(stop_len) = config.stop_condition.matched_suffix_len(&generated_tokens) {
                 generated_tokens.len().saturating_sub(stop_len)
             } else {
                 generated_tokens.len()
@@ -236,13 +187,18 @@ fn generate_completion_inner<B: Backend>(
         } else {
             tokenizer.decode(visible_tokens, true)?
         };
-        if let Some(callback) = &mut on_text {
-            if generated.len() > emitted_len {
-                callback(&generated[emitted_len..]);
-                emitted_len = generated.len();
-            }
+        if let Some(callback) = &mut on_text
+            && generated.len() > emitted_len
+        {
+            callback(&generated[emitted_len..]);
+            emitted_len = generated.len();
         }
-        if visible_token_count < generated_tokens.len() {
+        if visible_token_count < generated_tokens.len()
+            || config
+                .stop_condition
+                .matched_suffix_len(&generated_tokens)
+                .is_some()
+        {
             return Ok(generated);
         }
 
@@ -250,16 +206,16 @@ fn generate_completion_inner<B: Backend>(
         if position >= model.config().block_size.saturating_sub(1) {
             break;
         }
-        logits = measure(profile, "sample.decode_step", || {
+        logits = measure(config.profile, "sample.decode_step", || {
             model.forward_step(next_token, position, &mut cache)
         });
     }
 
     let generated = tokenizer.decode(&generated_tokens, true)?;
-    if let Some(callback) = &mut on_text {
-        if generated.len() > emitted_len {
-            callback(&generated[emitted_len..]);
-        }
+    if let Some(callback) = &mut on_text
+        && generated.len() > emitted_len
+    {
+        callback(&generated[emitted_len..]);
     }
     Ok(generated)
 }
@@ -293,7 +249,7 @@ pub fn select_next_token(
     rng: &mut Rng,
 ) -> Result<usize> {
     let adjusted = adjusted_logits(logits, strategy, seen_token_counts);
-    let probs = softmax(&adjusted);
+    let probs = softmax_values(&adjusted);
     rng.sample_weighted(&probs).ok_or_else(|| {
         RustGptError::Tensor("sampling failed because probabilities were invalid".to_string())
     })
@@ -401,7 +357,7 @@ fn select_next_token_from_topk_tensor<B: Backend>(
 ) -> Result<usize> {
     let (top_logits, top_indices) = logits.clone().topk_with_indices(top_k, 0);
     let adjusted = adjusted_topk_logits(&tensor_to_vec(&top_logits)?, strategy);
-    let probs = softmax(&adjusted);
+    let probs = softmax_values(&adjusted);
     let sampled_idx = rng.sample_weighted(&probs).ok_or_else(|| {
         RustGptError::Tensor("sampling failed because probabilities were invalid".to_string())
     })?;
@@ -436,7 +392,7 @@ fn apply_top_p(logits: &mut [f32], top_p: f32) {
     if top_p >= 1.0 {
         return;
     }
-    let probs = softmax(logits);
+    let probs = softmax_values(logits);
     let mut ranked = probs
         .iter()
         .copied()
@@ -466,6 +422,19 @@ fn tensor_to_vec<B: Backend>(tensor: &burn::tensor::Tensor<B, 1>) -> Result<Vec<
         .into_data()
         .to_vec::<f32>()
         .map_err(|err| RustGptError::Tensor(format!("failed to read logits from backend: {err:?}")))
+}
+
+fn softmax_values(logits: &[f32]) -> Vec<f32> {
+    let max_logit = logits
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, |acc, value| acc.max(value));
+    let exps = logits
+        .iter()
+        .map(|value| (value - max_logit).exp())
+        .collect::<Vec<_>>();
+    let total = exps.iter().sum::<f32>();
+    exps.into_iter().map(|value| value / total).collect()
 }
 
 fn int_tensor_to_vec<B: Backend>(

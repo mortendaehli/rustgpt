@@ -1,7 +1,8 @@
 use crate::core::config::{
     ActivationKind, BoundaryMode, ChatTemplateKind, DataFormat, DeviceKind, LrScheduleKind,
-    TokenizerModelKind, TrainMode,
+    PositionEncodingKind, TokenizerModelKind, TrainMode,
 };
+use crate::core::presets::TrainPreset;
 
 use super::{Command, parse_args};
 
@@ -129,8 +130,8 @@ fn train_parser_reads_swiglu_activation_override() {
 }
 
 #[test]
-fn train_parser_rejects_unsupported_position_override() {
-    let err = parse_args([
+fn train_parser_accepts_rope_position_override() {
+    let parsed = parse_args([
         "rustgpt".to_string(),
         "train".to_string(),
         "--data".to_string(),
@@ -138,17 +139,17 @@ fn train_parser_rejects_unsupported_position_override() {
         "--position".to_string(),
         "rope".to_string(),
     ])
-    .unwrap_err();
+    .unwrap();
 
-    assert_eq!(
-        err.to_string(),
-        "the Burn runtime currently supports only --position learned"
-    );
+    let Command::Train(parsed) = parsed else {
+        panic!("expected train command");
+    };
+    assert_eq!(parsed.train.position_encoding, PositionEncodingKind::Rope);
 }
 
 #[test]
-fn train_parser_rejects_mismatched_kv_head_override() {
-    let err = parse_args([
+fn train_parser_accepts_grouped_kv_head_override() {
+    let parsed = parse_args([
         "rustgpt".to_string(),
         "train".to_string(),
         "--data".to_string(),
@@ -158,11 +159,32 @@ fn train_parser_rejects_mismatched_kv_head_override() {
         "--n-kv-head".to_string(),
         "2".to_string(),
     ])
+    .unwrap();
+
+    let Command::Train(parsed) = parsed else {
+        panic!("expected train command");
+    };
+    assert_eq!(parsed.train.n_head, 8);
+    assert_eq!(parsed.train.n_kv_head, 2);
+}
+
+#[test]
+fn train_parser_rejects_non_divisible_kv_head_override() {
+    let err = parse_args([
+        "rustgpt".to_string(),
+        "train".to_string(),
+        "--data".to_string(),
+        "names.txt".to_string(),
+        "--n-head".to_string(),
+        "10".to_string(),
+        "--n-kv-head".to_string(),
+        "3".to_string(),
+    ])
     .unwrap_err();
 
     assert_eq!(
         err.to_string(),
-        "the Burn runtime currently supports only --n-kv-head matching --n-head (got 2 vs 8)"
+        "--n-head must be divisible by --n-kv-head for grouped-query attention (got 10 vs 3)"
     );
 }
 
@@ -255,6 +277,99 @@ fn train_parser_reads_validation_and_schedule_flags() {
 }
 
 #[test]
+fn train_parser_applies_named_preset() {
+    let command = parse_args([
+        "rustgpt".to_string(),
+        "train".to_string(),
+        "--data".to_string(),
+        "names.txt".to_string(),
+        "--preset".to_string(),
+        "class-small".to_string(),
+    ])
+    .unwrap();
+
+    let Command::Train(parsed) = command else {
+        panic!("expected train command");
+    };
+    let preset = TrainPreset::ClassSmall.train_config();
+    assert_eq!(parsed.train.n_layer, preset.n_layer);
+    assert_eq!(parsed.train.n_embd, preset.n_embd);
+    assert_eq!(parsed.train.n_head, preset.n_head);
+    assert_eq!(parsed.train.position_encoding, preset.position_encoding);
+    assert_eq!(parsed.train.activation, preset.activation);
+    assert_eq!(parsed.train.device, preset.device);
+    assert_eq!(
+        parsed.train.gradient_accumulation_steps,
+        preset.gradient_accumulation_steps
+    );
+    assert_eq!(
+        parsed.train.activation_checkpointing,
+        preset.activation_checkpointing
+    );
+}
+
+#[test]
+fn train_parser_allows_overrides_after_preset() {
+    let command = parse_args([
+        "rustgpt".to_string(),
+        "train".to_string(),
+        "--data".to_string(),
+        "names.txt".to_string(),
+        "--preset".to_string(),
+        "debug-tiny".to_string(),
+        "--steps".to_string(),
+        "12".to_string(),
+        "--device".to_string(),
+        "gpu".to_string(),
+    ])
+    .unwrap();
+
+    let Command::Train(parsed) = command else {
+        panic!("expected train command");
+    };
+    assert_eq!(parsed.train.n_layer, 4);
+    assert_eq!(parsed.train.position_encoding, PositionEncodingKind::Rope);
+    assert_eq!(parsed.train.activation, ActivationKind::SwiGlu);
+    assert_eq!(parsed.train.steps, 12);
+    assert_eq!(parsed.train.device, DeviceKind::Gpu);
+}
+
+#[test]
+fn train_parser_reads_gradient_accumulation_override() {
+    let command = parse_args([
+        "rustgpt".to_string(),
+        "train".to_string(),
+        "--data".to_string(),
+        "names.txt".to_string(),
+        "--grad-accum-steps".to_string(),
+        "3".to_string(),
+    ])
+    .unwrap();
+
+    let Command::Train(parsed) = command else {
+        panic!("expected train command");
+    };
+    assert_eq!(parsed.train.gradient_accumulation_steps, 3);
+}
+
+#[test]
+fn train_parser_enables_activation_checkpointing_flag() {
+    let command = parse_args([
+        "rustgpt".to_string(),
+        "train".to_string(),
+        "--data".to_string(),
+        "names.txt".to_string(),
+        "--activation-checkpointing".to_string(),
+    ])
+    .unwrap();
+
+    let Command::Train(parsed) = command else {
+        panic!("expected train command");
+    };
+    assert!(parsed.train.activation_checkpointing);
+}
+
+#[test]
 fn prepare_data_parser_reads_output_options() {
     let command = parse_args([
         "rustgpt".to_string(),
@@ -267,6 +382,14 @@ fn prepare_data_parser_reads_output_options() {
         "prepared.jsonl".to_string(),
         "--out-format".to_string(),
         "jsonl-chat".to_string(),
+        "--dedup".to_string(),
+        "--min-chars".to_string(),
+        "12".to_string(),
+        "--max-chars".to_string(),
+        "128".to_string(),
+        "--min-messages".to_string(),
+        "2".to_string(),
+        "--require-assistant".to_string(),
         "--pretty".to_string(),
     ])
     .unwrap();
@@ -276,6 +399,11 @@ fn prepare_data_parser_reads_output_options() {
     };
     assert_eq!(parsed.data.format, DataFormat::ParquetChat);
     assert_eq!(parsed.prepare.output_format, DataFormat::JsonlChat);
+    assert!(parsed.prepare.dedup);
+    assert_eq!(parsed.prepare.min_chars, 12);
+    assert_eq!(parsed.prepare.max_chars, 128);
+    assert_eq!(parsed.prepare.min_messages, 2);
+    assert!(parsed.prepare.require_assistant);
     assert!(parsed.prepare.pretty);
 }
 

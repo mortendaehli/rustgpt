@@ -1,3 +1,5 @@
+use crate::core::presets::train_presets_help;
+
 pub(super) fn global_help(bin: &str) -> String {
     format!(
         "\
@@ -37,6 +39,7 @@ Run `{bin} <command> --help` for command-specific options."
 }
 
 pub(super) fn train_help(bin: &str) -> String {
+    let preset_help = train_presets_help();
     format!(
         "\
 Usage:
@@ -44,6 +47,7 @@ Usage:
 
 Options:
   --data <PATH>         Path to the training corpus. Default: input.txt
+  --preset <NAME>       Apply one of: {preset_help}. Later flags override the preset
   --checkpoint-out <P>  Write a checkpoint after training
   --resume <P>          Resume model weights and optimizer state from a checkpoint
   --best-checkpoint-out <P>
@@ -66,16 +70,20 @@ Options:
   --valid-max-examples <N>
                         Maximum validation examples/windows per eval. Default: 64
   --batch-size <N>      Sequences per optimizer step. Default: 1
+  --grad-accum-steps <N>
+                        Gradient accumulation micro-steps per optimizer step. Default: 1
+  --activation-checkpointing
+                        Recompute selected activations during backward to reduce memory use
   --seed <N>            RNG seed. Default: 42
   --sample-every <N>    Sampling/log interval. Default: 100
   --block-size <N>      Context window size. Default: 16
   --n-layer <N>         Number of transformer layers. Default: 1
   --n-embd <N>          Embedding width. Default: 16
   --n-head <N>          Attention heads. Default: 4
-  --n-kv-head <N>       Key/value heads. Burn runtime currently requires matching --n-head
+  --n-kv-head <N>       Key/value heads. Must divide --n-head for grouped-query attention
   --tied-embeddings     Reuse token embeddings as the output projection
   --activation <K>      MLP activation: relu | gelu | swiglu. Default: relu
-  --position <K>        Position encoding: learned. Default: learned
+  --position <K>        Position encoding: learned | rope. Default: learned
   --lr <F32>            Learning rate. Default: 0.01
   --beta1 <F32>         Adam beta1. Default: 0.85
   --beta2 <F32>         Adam beta2. Default: 0.99
@@ -148,6 +156,11 @@ Options:
   --lowercase           Lowercase the source dataset before export
   --out <PATH>          Output path. Default: prepared.jsonl
   --out-format <MODE>   Output format: lines | text | jsonl-text | jsonl-chat | parquet-text | parquet-chat. Default: jsonl-text
+  --dedup               Drop exact duplicate rendered documents during export
+  --min-chars <N>       Drop records shorter than N rendered characters. Default: 0
+  --max-chars <N>       Drop records longer than N rendered characters. Default: 0 (disabled)
+  --min-messages <N>    Drop chat records with fewer than N messages. Default: 0
+  --require-assistant   Drop chat records that do not contain an assistant turn
   --pretty              Pretty-print JSONL rows for inspection"
     )
 }

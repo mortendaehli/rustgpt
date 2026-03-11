@@ -2,6 +2,7 @@
 //! This keeps parser-specific IO inside the data layer so the trainer can stay focused on
 //! normalized text/chat records.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -13,51 +14,62 @@ use arrow_schema::{DataType, Field, Fields, Schema};
 use parquet::arrow::ArrowWriter;
 use serde_json::json;
 
-use crate::core::config::{ChatTemplateKind, DataFormat};
+use crate::core::config::{ChatTemplateKind, DataFormat, PrepareDataConfig};
 use crate::core::error::{Result, RustGptError};
 use crate::data::corpus::Dataset;
-use crate::data::schema::{ChatRecord, DatasetRecord, TextRecord};
+use crate::data::schema::{ChatRecord, DatasetRecord, MessageRole, TextRecord};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedDataSummary {
     pub output_path: PathBuf,
     pub output_format: DataFormat,
+    pub input_records: usize,
     pub records: usize,
+    pub duplicate_records_removed: usize,
+    pub quality_filtered_records: usize,
 }
 
 pub fn write_dataset(
     dataset: &Dataset,
     template: ChatTemplateKind,
     output_path: impl AsRef<Path>,
-    output_format: DataFormat,
-    pretty: bool,
+    prepare: &PrepareDataConfig,
 ) -> Result<PreparedDataSummary> {
     let output_path = output_path.as_ref();
-    match output_format {
-        DataFormat::Lines => write_rendered_lines(dataset, template, output_path)?,
-        DataFormat::PlainText => write_rendered_text(dataset, template, output_path)?,
-        DataFormat::JsonlText => write_jsonl_text(dataset, template, output_path, pretty)?,
-        DataFormat::JsonlChat => write_jsonl_chat(dataset, output_path, pretty)?,
-        DataFormat::ParquetText => write_parquet_text(dataset, template, output_path)?,
-        DataFormat::ParquetChat => write_parquet_chat(dataset, output_path)?,
+    let filtered = filter_records(dataset.records(), template, prepare)?;
+    match prepare.output_format {
+        DataFormat::Lines => write_rendered_lines(&filtered.records, template, output_path)?,
+        DataFormat::PlainText => write_rendered_text(&filtered.records, template, output_path)?,
+        DataFormat::JsonlText => {
+            write_jsonl_text(&filtered.records, template, output_path, prepare.pretty)?
+        }
+        DataFormat::JsonlChat => write_jsonl_chat(&filtered.records, output_path, prepare.pretty)?,
+        DataFormat::ParquetText => write_parquet_text(&filtered.records, template, output_path)?,
+        DataFormat::ParquetChat => write_parquet_chat(&filtered.records, output_path)?,
     }
 
     Ok(PreparedDataSummary {
         output_path: output_path.to_path_buf(),
-        output_format,
-        records: dataset.len(),
+        output_format: prepare.output_format,
+        input_records: dataset.len(),
+        records: filtered.records.len(),
+        duplicate_records_removed: filtered.duplicate_records_removed,
+        quality_filtered_records: filtered.quality_filtered_records,
     })
 }
 
 fn write_rendered_lines(
-    dataset: &Dataset,
+    records: &[DatasetRecord],
     template: ChatTemplateKind,
     output_path: &Path,
 ) -> Result<()> {
     let file = File::create(output_path)
         .map_err(|source| RustGptError::io_with_path(output_path, source))?;
     let mut writer = BufWriter::new(file);
-    for doc in dataset.docs_with_template(template) {
+    for doc in records
+        .iter()
+        .map(|record| record.rendered_text_with_template(template))
+    {
         writer
             .write_all(doc.as_bytes())
             .map_err(|source| RustGptError::io_with_path(output_path, source))?;
@@ -71,17 +83,21 @@ fn write_rendered_lines(
 }
 
 fn write_rendered_text(
-    dataset: &Dataset,
+    records: &[DatasetRecord],
     template: ChatTemplateKind,
     output_path: &Path,
 ) -> Result<()> {
-    let joined = dataset.docs_with_template(template).join("\n\n");
+    let joined = records
+        .iter()
+        .map(|record| record.rendered_text_with_template(template))
+        .collect::<Vec<_>>()
+        .join("\n\n");
     std::fs::write(output_path, joined)
         .map_err(|source| RustGptError::io_with_path(output_path, source))
 }
 
 fn write_jsonl_text(
-    dataset: &Dataset,
+    records: &[DatasetRecord],
     template: ChatTemplateKind,
     output_path: &Path,
     pretty: bool,
@@ -89,7 +105,7 @@ fn write_jsonl_text(
     let file = File::create(output_path)
         .map_err(|source| RustGptError::io_with_path(output_path, source))?;
     let mut writer = BufWriter::new(file);
-    for record in text_records(dataset, template) {
+    for record in text_records(records, template) {
         write_json_line(&mut writer, &record, pretty, output_path)?;
     }
     writer
@@ -97,11 +113,11 @@ fn write_jsonl_text(
         .map_err(|source| RustGptError::io_with_path(output_path, source))
 }
 
-fn write_jsonl_chat(dataset: &Dataset, output_path: &Path, pretty: bool) -> Result<()> {
+fn write_jsonl_chat(records: &[DatasetRecord], output_path: &Path, pretty: bool) -> Result<()> {
     let file = File::create(output_path)
         .map_err(|source| RustGptError::io_with_path(output_path, source))?;
     let mut writer = BufWriter::new(file);
-    for record in chat_records(dataset)? {
+    for record in chat_records(records)? {
         write_json_line(&mut writer, &record, pretty, output_path)?;
     }
     writer
@@ -133,11 +149,11 @@ fn write_json_line<T: serde::Serialize>(
 }
 
 fn write_parquet_text(
-    dataset: &Dataset,
+    records: &[DatasetRecord],
     template: ChatTemplateKind,
     output_path: &Path,
 ) -> Result<()> {
-    let records = text_records(dataset, template);
+    let records = text_records(records, template);
     let mut text_builder = StringBuilder::new();
     let mut source_builder = StringBuilder::new();
     let mut meta_builder = StringBuilder::new();
@@ -168,8 +184,8 @@ fn write_parquet_text(
     write_parquet_batch(output_path, schema, &batch)
 }
 
-fn write_parquet_chat(dataset: &Dataset, output_path: &Path) -> Result<()> {
-    let records = chat_records(dataset)?;
+fn write_parquet_chat(records: &[DatasetRecord], output_path: &Path) -> Result<()> {
+    let records = chat_records(records)?;
     let message_fields = Fields::from(vec![
         Field::new("role", DataType::Utf8, false),
         Field::new("content", DataType::Utf8, false),
@@ -257,9 +273,8 @@ fn write_parquet_batch(output_path: &Path, schema: Arc<Schema>, batch: &RecordBa
     Ok(())
 }
 
-fn text_records(dataset: &Dataset, template: ChatTemplateKind) -> Vec<TextRecord> {
-    dataset
-        .records()
+fn text_records(records: &[DatasetRecord], template: ChatTemplateKind) -> Vec<TextRecord> {
+    records
         .iter()
         .map(|record| match record {
             DatasetRecord::Text(record) => record.clone(),
@@ -275,9 +290,8 @@ fn text_records(dataset: &Dataset, template: ChatTemplateKind) -> Vec<TextRecord
         .collect()
 }
 
-fn chat_records(dataset: &Dataset) -> Result<Vec<ChatRecord>> {
-    dataset
-        .records()
+fn chat_records(records: &[DatasetRecord]) -> Result<Vec<ChatRecord>> {
+    records
         .iter()
         .map(|record| match record {
             DatasetRecord::Chat(record) => Ok(record.clone()),
@@ -288,15 +302,103 @@ fn chat_records(dataset: &Dataset) -> Result<Vec<ChatRecord>> {
         .collect()
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct FilteredRecords {
+    records: Vec<DatasetRecord>,
+    duplicate_records_removed: usize,
+    quality_filtered_records: usize,
+}
+
+fn filter_records(
+    records: &[DatasetRecord],
+    template: ChatTemplateKind,
+    prepare: &PrepareDataConfig,
+) -> Result<FilteredRecords> {
+    if prepare.max_chars > 0 && prepare.max_chars < prepare.min_chars {
+        return Err(RustGptError::Data(format!(
+            "prepare-data max_chars ({}) must be >= min_chars ({})",
+            prepare.max_chars, prepare.min_chars
+        )));
+    }
+
+    let mut kept = Vec::with_capacity(records.len());
+    let mut seen = HashSet::new();
+    let mut duplicate_records_removed = 0;
+    let mut quality_filtered_records = 0;
+
+    for record in records {
+        if !passes_quality_filters(record, template, prepare) {
+            quality_filtered_records += 1;
+            continue;
+        }
+
+        if prepare.dedup {
+            let rendered = record.rendered_text_with_template(template);
+            if !seen.insert(rendered) {
+                duplicate_records_removed += 1;
+                continue;
+            }
+        }
+
+        kept.push(record.clone());
+    }
+
+    if kept.is_empty() {
+        return Err(RustGptError::Data(
+            "prepare-data removed every record; relax dedup or quality filters".to_string(),
+        ));
+    }
+
+    Ok(FilteredRecords {
+        records: kept,
+        duplicate_records_removed,
+        quality_filtered_records,
+    })
+}
+
+fn passes_quality_filters(
+    record: &DatasetRecord,
+    template: ChatTemplateKind,
+    prepare: &PrepareDataConfig,
+) -> bool {
+    let rendered = record.rendered_text_with_template(template);
+    let char_count = rendered.chars().count();
+    if char_count < prepare.min_chars {
+        return false;
+    }
+    if prepare.max_chars > 0 && char_count > prepare.max_chars {
+        return false;
+    }
+
+    match record {
+        DatasetRecord::Text(_) => true,
+        DatasetRecord::Chat(chat) => {
+            if chat.messages.len() < prepare.min_messages {
+                return false;
+            }
+            if prepare.require_assistant
+                && !chat
+                    .messages
+                    .iter()
+                    .any(|message| matches!(message.role, MessageRole::Assistant))
+            {
+                return false;
+            }
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::core::config::PrepareDataConfig;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::core::config::{ChatTemplateKind, DataFormat};
     use crate::data::corpus::Dataset;
-    use crate::data::schema::DatasetRecord;
+    use crate::data::schema::{ChatRecord, DatasetRecord, Message, MessageRole};
 
-    use super::write_dataset;
+    use super::{filter_records, write_dataset};
 
     #[test]
     fn writes_jsonl_text_from_plain_text() {
@@ -306,8 +408,10 @@ mod tests {
             &dataset,
             ChatTemplateKind::SimpleTranscript,
             &path,
-            DataFormat::JsonlText,
-            false,
+            &PrepareDataConfig {
+                output_format: DataFormat::JsonlText,
+                ..PrepareDataConfig::default()
+            },
         )
         .unwrap();
 
@@ -324,8 +428,10 @@ mod tests {
             &dataset,
             ChatTemplateKind::SimpleTranscript,
             &path,
-            DataFormat::ParquetText,
-            false,
+            &PrepareDataConfig {
+                output_format: DataFormat::ParquetText,
+                ..PrepareDataConfig::default()
+            },
         )
         .unwrap();
 
@@ -353,8 +459,10 @@ mod tests {
             &dataset,
             ChatTemplateKind::ChatMl,
             &path,
-            DataFormat::ParquetChat,
-            false,
+            &PrepareDataConfig {
+                output_format: DataFormat::ParquetChat,
+                ..PrepareDataConfig::default()
+            },
         )
         .unwrap();
 
@@ -371,6 +479,69 @@ mod tests {
             &loaded.records()[0],
             DatasetRecord::Chat(record) if record.messages.len() == 2
         ));
+    }
+
+    #[test]
+    fn prepare_filters_dedup_and_quality_constraints() {
+        let dataset = Dataset::from_records(
+            DataFormat::JsonlChat,
+            vec![
+                DatasetRecord::Chat(ChatRecord {
+                    messages: vec![
+                        Message {
+                            role: MessageRole::User,
+                            content: "hello".to_string(),
+                        },
+                        Message {
+                            role: MessageRole::Assistant,
+                            content: "hi".to_string(),
+                        },
+                    ],
+                    source: None,
+                    meta: None,
+                }),
+                DatasetRecord::Chat(ChatRecord {
+                    messages: vec![
+                        Message {
+                            role: MessageRole::User,
+                            content: "hello".to_string(),
+                        },
+                        Message {
+                            role: MessageRole::Assistant,
+                            content: "hi".to_string(),
+                        },
+                    ],
+                    source: None,
+                    meta: None,
+                }),
+                DatasetRecord::Chat(ChatRecord {
+                    messages: vec![Message {
+                        role: MessageRole::User,
+                        content: "tiny".to_string(),
+                    }],
+                    source: None,
+                    meta: None,
+                }),
+            ],
+        )
+        .unwrap();
+
+        let filtered = filter_records(
+            dataset.records(),
+            ChatTemplateKind::SimpleTranscript,
+            &PrepareDataConfig {
+                dedup: true,
+                min_chars: 8,
+                min_messages: 2,
+                require_assistant: true,
+                ..PrepareDataConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(filtered.records.len(), 1);
+        assert_eq!(filtered.duplicate_records_removed, 1);
+        assert_eq!(filtered.quality_filtered_records, 1);
     }
 
     fn temp_chat_jsonl_path() -> std::path::PathBuf {

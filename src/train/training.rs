@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use burn::module::AutodiffModule;
-use burn::optim::{GradientsParams, Optimizer};
+use burn::optim::{GradientsAccumulator, GradientsParams, Optimizer};
 use burn::tensor::activation::log_softmax;
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Bool, Int, Tensor, TensorData};
@@ -12,9 +12,9 @@ use crate::core::error::{Result, RustGptError};
 use crate::data::corpus::Dataset;
 use crate::data::tokenizer::Tokenizer;
 use crate::data::training_data::{SequenceExample, TrainingData};
-use crate::engine::checkpoint::read_checkpoint_metadata;
-use crate::engine::model::{LanguageModel, LanguageModelOptimizer, build_optimizer, init_model};
-use crate::engine::profile::{RuntimeProfile, measure};
+use crate::model::lm::{LanguageModel, LanguageModelOptimizer, build_optimizer, init_model};
+use crate::runtime::checkpoint::{CheckpointRunManifest, read_checkpoint_metadata};
+use crate::runtime::profile::{RuntimeProfile, measure};
 
 #[derive(Clone, Debug)]
 pub struct PreparedTrainingRun {
@@ -26,6 +26,7 @@ pub struct PreparedTrainingRun {
     pub starting_step: usize,
     pub checkpoint_seed: u64,
     pub chat_template: ChatTemplateKind,
+    pub resume_manifest: Option<CheckpointRunManifest>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -34,7 +35,10 @@ pub struct TrainingLogEntry {
     pub total_step: usize,
     pub loss: f32,
     pub batch_size: usize,
+    pub processed_tokens: usize,
     pub learning_rate: f32,
+    pub tokens_per_second: f32,
+    pub step_elapsed: Duration,
     pub validation_loss: Option<f32>,
     pub best_validation_loss: Option<f32>,
     pub elapsed: Duration,
@@ -46,6 +50,9 @@ pub struct TrainingRunSummary {
     pub final_loss: f32,
     pub final_validation_loss: Option<f32>,
     pub best_validation_loss: Option<f32>,
+    pub total_tokens: usize,
+    pub average_tokens_per_second: f32,
+    pub elapsed: Duration,
     pub log_entries: Vec<TrainingLogEntry>,
 }
 
@@ -57,6 +64,18 @@ pub struct TrainingArtifacts<AD: AutodiffBackend> {
 pub type ValidationHook<'a, AD> =
     dyn FnMut(usize, f32, &LanguageModel<AD>, &LanguageModelOptimizer<AD>) -> Result<()> + 'a;
 
+pub struct TrainingRunRequest<'a, AD: AutodiffBackend> {
+    pub tokenizer: &'a Tokenizer,
+    pub training_data: &'a TrainingData,
+    pub train_config: &'a TrainConfig,
+    pub starting_step: usize,
+    pub device: &'a AD::Device,
+    pub profile: Option<&'a RuntimeProfile>,
+    pub capture_logs: bool,
+    pub validation_data: Option<&'a TrainingData>,
+    pub on_validation: Option<&'a mut ValidationHook<'a, AD>>,
+}
+
 pub fn prepare_training_run(
     data_config: &DataConfig,
     train_config: &TrainConfig,
@@ -64,7 +83,7 @@ pub fn prepare_training_run(
     resume_path: Option<&Path>,
 ) -> Result<PreparedTrainingRun> {
     let dataset = Dataset::from_path(data_config)?;
-    let (model_config, tokenizer, starting_step, checkpoint_seed, chat_template) =
+    let (model_config, tokenizer, starting_step, checkpoint_seed, chat_template, resume_manifest) =
         if let Some(resume_path) = resume_path {
             let checkpoint = read_checkpoint_metadata(resume_path)?;
             (
@@ -73,6 +92,7 @@ pub fn prepare_training_run(
                 checkpoint.trained_steps,
                 checkpoint.seed,
                 checkpoint.chat_template,
+                checkpoint.run_manifest,
             )
         } else {
             let tokenizer = build_tokenizer(data_config, &dataset, train_config)?;
@@ -84,6 +104,7 @@ pub fn prepare_training_run(
                 0,
                 train_config.seed,
                 data_config.chat_template,
+                None,
             )
         };
     let mut data_rng = crate::core::rng::Rng::from_seed(checkpoint_seed);
@@ -120,6 +141,7 @@ pub fn prepare_training_run(
         starting_step,
         checkpoint_seed,
         chat_template,
+        resume_manifest,
     })
 }
 
@@ -138,22 +160,26 @@ impl<AD: AutodiffBackend> TrainingArtifacts<AD> {
 
 pub fn run_training_steps<B, AD>(
     artifacts: TrainingArtifacts<AD>,
-    tokenizer: &Tokenizer,
-    training_data: &TrainingData,
-    train_config: &TrainConfig,
-    starting_step: usize,
-    device: &AD::Device,
-    profile: Option<&RuntimeProfile>,
-    capture_logs: bool,
-    validation_data: Option<&TrainingData>,
-    mut on_validation: Option<&mut ValidationHook<'_, AD>>,
+    request: TrainingRunRequest<'_, AD>,
 ) -> Result<(TrainingArtifacts<AD>, TrainingRunSummary)>
 where
     B: Backend<Device = AD::Device>,
     AD: AutodiffBackend<InnerBackend = B>,
 {
+    let TrainingRunRequest {
+        tokenizer,
+        training_data,
+        train_config,
+        starting_step,
+        device,
+        profile,
+        capture_logs,
+        validation_data,
+        mut on_validation,
+    } = request;
     let started_at = Instant::now();
     let batch_size = usize::max(1, train_config.batch_size);
+    let grad_accum_steps = usize::max(1, train_config.gradient_accumulation_steps);
     validate_train_loop_config(train_config)?;
     let mut summary = TrainingRunSummary::default();
     let mut best_validation_loss = None::<f32>;
@@ -162,33 +188,57 @@ where
     let total_steps = total_training_steps(starting_step, train_config.steps);
 
     for step in 0..train_config.steps {
+        let step_started_at = Instant::now();
         let absolute_step = starting_step + step;
         let should_log = should_log_step(step, absolute_step, train_config);
         let example_start_idx = absolute_step
-            .checked_mul(batch_size)
+            .checked_mul(batch_size.saturating_mul(grad_accum_steps))
             .unwrap_or(absolute_step);
-        let batch_examples =
-            training_data.build_batch(example_start_idx, batch_size, model.config().block_size);
-        let first_doc = tokenizer.decode(&batch_examples[0].tokens_with_boundaries(), true)?;
-        let batch = measure(profile, "train.batch.build", || {
-            build_batch_tensors::<AD>(&batch_examples, tokenizer, device)
-        })?;
+        let mut processed_tokens = 0;
+        let mut mean_loss_sum = 0.0;
+        let mut first_doc = None;
+        let mut grads_accumulator = GradientsAccumulator::<LanguageModel<AD>>::new();
 
-        let logits = measure(profile, "train.forward", || {
-            model.forward(batch.input_ids, Some(batch.pad_mask))
-        });
-        let (loss, batch_mean_loss) = measure(profile, "train.loss", || {
-            compute_weighted_loss(
-                logits,
-                batch.target_ids,
-                batch.loss_weights,
-                batch.weight_sum,
-            )
-        })?;
+        for micro_step in 0..grad_accum_steps {
+            let micro_start_idx = example_start_idx + micro_step * batch_size;
+            let batch_examples =
+                training_data.build_batch(micro_start_idx, batch_size, model.config().block_size);
+            processed_tokens += batch_examples
+                .iter()
+                .map(SequenceExample::len)
+                .sum::<usize>();
+            if first_doc.is_none() {
+                first_doc =
+                    Some(tokenizer.decode(&batch_examples[0].tokens_with_boundaries(), true)?);
+            }
+            let batch = measure(profile, "train.batch.build", || {
+                build_batch_tensors::<AD>(&batch_examples, tokenizer, device)
+            })?;
+
+            let logits = measure(profile, "train.forward", || {
+                model.forward(batch.input_ids, Some(batch.pad_mask))
+            });
+            let (loss, batch_mean_loss) = measure(profile, "train.loss", || {
+                compute_weighted_loss(
+                    logits,
+                    batch.target_ids,
+                    batch.loss_weights,
+                    batch.weight_sum,
+                )
+            })?;
+            mean_loss_sum += batch_mean_loss;
+
+            let scaled_loss = loss.div_scalar(grad_accum_steps as f32);
+            let grads = measure(profile, "train.backward", || scaled_loss.backward());
+            let grads = GradientsParams::from_grads(grads, &model);
+            grads_accumulator.accumulate(&model, grads);
+        }
+
+        summary.total_tokens += processed_tokens;
+        let batch_mean_loss = mean_loss_sum / grad_accum_steps as f32;
         summary.final_loss = batch_mean_loss;
-
-        let grads = measure(profile, "train.backward", || loss.backward());
-        let grads = GradientsParams::from_grads(grads, &model);
+        let first_doc = first_doc.unwrap_or_default();
+        let grads = grads_accumulator.grads();
         let learning_rate = learning_rate_at_step(train_config, absolute_step, total_steps) as f64;
         model = measure(profile, "train.optimize", || {
             optimizer.step(learning_rate, model, grads)
@@ -225,14 +275,19 @@ where
         } else {
             None
         };
+        let step_elapsed = step_started_at.elapsed();
+        let tokens_per_second = processed_tokens as f32 / step_elapsed.as_secs_f32().max(1e-6);
 
         if should_log && capture_logs {
             summary.log_entries.push(TrainingLogEntry {
                 run_step: step + 1,
                 total_step: absolute_step + 1,
                 loss: batch_mean_loss,
-                batch_size,
+                batch_size: batch_size * grad_accum_steps,
+                processed_tokens,
                 learning_rate: learning_rate as f32,
+                tokens_per_second,
+                step_elapsed,
                 validation_loss,
                 best_validation_loss,
                 elapsed: started_at.elapsed(),
@@ -241,6 +296,10 @@ where
         }
     }
 
+    summary.elapsed = started_at.elapsed();
+    summary.average_tokens_per_second =
+        summary.total_tokens as f32 / summary.elapsed.as_secs_f32().max(1e-6);
+
     Ok((TrainingArtifacts { model, optimizer }, summary))
 }
 
@@ -248,6 +307,11 @@ fn validate_train_loop_config(train_config: &TrainConfig) -> Result<()> {
     if train_config.sample_every == 0 {
         return Err(RustGptError::Config(
             "sample_every must be at least 1".to_string(),
+        ));
+    }
+    if train_config.gradient_accumulation_steps == 0 {
+        return Err(RustGptError::Config(
+            "gradient_accumulation_steps must be at least 1".to_string(),
         ));
     }
     if train_config.validation_max_examples == 0 {
@@ -453,7 +517,7 @@ fn total_training_steps(starting_step: usize, run_steps: usize) -> usize {
 fn should_log_step(run_step: usize, absolute_step: usize, train_config: &TrainConfig) -> bool {
     run_step == 0
         || (run_step + 1) == train_config.steps
-        || ((absolute_step + 1) % train_config.sample_every == 0)
+        || (absolute_step + 1).is_multiple_of(train_config.sample_every)
 }
 
 pub fn learning_rate_at_step(train_config: &TrainConfig, step: usize, total_steps: usize) -> f32 {
@@ -479,9 +543,39 @@ pub fn learning_rate_at_step(train_config: &TrainConfig, step: usize, total_step
 
 #[cfg(test)]
 mod tests {
-    use crate::core::config::{LrScheduleKind, TrainConfig};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{learning_rate_at_step, should_log_step, total_training_steps};
+    use burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing;
+    use burn::backend::{Autodiff, NdArray};
+
+    use crate::core::config::{
+        BoundaryMode, ChatTemplateKind, DataFormat, LrScheduleKind, TrainConfig, TrainMode,
+    };
+    use crate::data::corpus::Dataset;
+    use crate::data::tokenizer::Tokenizer;
+    use crate::data::training_data::TrainingData;
+    use crate::runtime::checkpoint::{
+        SaveTrainingCheckpointRequest, load_training_checkpoint, save_training_checkpoint,
+    };
+
+    use super::{
+        TrainingArtifacts, TrainingRunRequest, learning_rate_at_step, run_training_steps,
+        should_log_step, total_training_steps,
+    };
+
+    type TestBackend = NdArray<f32>;
+    type TestAutodiffBackend = Autodiff<TestBackend>;
+    type TestCheckpointAutodiffBackend = Autodiff<TestBackend, BalancedCheckpointing>;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("rustgpt-{unique}-{name}"))
+    }
 
     #[test]
     fn resume_schedule_uses_absolute_step_against_total_target() {
@@ -510,5 +604,216 @@ mod tests {
         assert!(should_log_step(0, 7, &train_config));
         assert!(!should_log_step(1, 8, &train_config));
         assert!(should_log_step(2, 9, &train_config));
+    }
+
+    #[test]
+    fn tiny_run_can_overfit_a_single_example() {
+        let dataset = Dataset::from_text("hello\n", DataFormat::Lines, false).unwrap();
+        let tokenizer = Tokenizer::from_docs(dataset.docs(), BoundaryMode::SharedBos).unwrap();
+        let training_data = TrainingData::from_dataset(
+            &dataset,
+            &tokenizer,
+            TrainMode::Auto,
+            ChatTemplateKind::SimpleTranscript,
+        )
+        .unwrap();
+        let train_config = TrainConfig {
+            steps: 12,
+            sample_every: 1,
+            batch_size: 1,
+            gradient_accumulation_steps: 2,
+            learning_rate: 0.05,
+            warmup_steps: 0,
+            lr_schedule: LrScheduleKind::Linear,
+            block_size: 8,
+            n_layer: 1,
+            n_embd: 16,
+            n_head: 4,
+            n_kv_head: 0,
+            ..TrainConfig::default()
+        };
+        let model_config = train_config.to_model_config(tokenizer.vocab_size());
+        let device = Default::default();
+        let artifacts =
+            TrainingArtifacts::<TestAutodiffBackend>::new(&model_config, &train_config, &device)
+                .unwrap();
+
+        let (_artifacts, summary) = run_training_steps::<TestBackend, TestAutodiffBackend>(
+            artifacts,
+            TrainingRunRequest {
+                tokenizer: &tokenizer,
+                training_data: &training_data,
+                train_config: &train_config,
+                starting_step: 0,
+                device: &device,
+                profile: None,
+                capture_logs: true,
+                validation_data: None,
+                on_validation: None,
+            },
+        )
+        .unwrap();
+
+        let first_loss = summary.log_entries.first().unwrap().loss;
+        let last_loss = summary.log_entries.last().unwrap().loss;
+        assert!(last_loss < first_loss, "{first_loss} !> {last_loss}");
+        assert!(summary.total_tokens > 0);
+        assert!(summary.average_tokens_per_second > 0.0);
+        assert_eq!(summary.log_entries.first().unwrap().batch_size, 2);
+        assert!(
+            summary
+                .log_entries
+                .iter()
+                .all(|entry| entry.tokens_per_second > 0.0 && entry.processed_tokens > 0)
+        );
+    }
+
+    #[test]
+    fn checkpoint_resume_smoke_test_continues_total_step_count() {
+        let dataset = Dataset::from_text("hello\nworld\n", DataFormat::Lines, false).unwrap();
+        let tokenizer = Tokenizer::from_docs(dataset.docs(), BoundaryMode::SharedBos).unwrap();
+        let training_data = TrainingData::from_dataset(
+            &dataset,
+            &tokenizer,
+            TrainMode::Auto,
+            ChatTemplateKind::SimpleTranscript,
+        )
+        .unwrap();
+        let train_config = TrainConfig {
+            steps: 2,
+            sample_every: 1,
+            batch_size: 1,
+            learning_rate: 0.05,
+            warmup_steps: 0,
+            lr_schedule: LrScheduleKind::Linear,
+            block_size: 8,
+            n_layer: 1,
+            n_embd: 16,
+            n_head: 4,
+            n_kv_head: 0,
+            ..TrainConfig::default()
+        };
+        let model_config = train_config.to_model_config(tokenizer.vocab_size());
+        let device = Default::default();
+        let artifacts =
+            TrainingArtifacts::<TestAutodiffBackend>::new(&model_config, &train_config, &device)
+                .unwrap();
+
+        let (artifacts, _) = run_training_steps::<TestBackend, TestAutodiffBackend>(
+            artifacts,
+            TrainingRunRequest {
+                tokenizer: &tokenizer,
+                training_data: &training_data,
+                train_config: &train_config,
+                starting_step: 0,
+                device: &device,
+                profile: None,
+                capture_logs: true,
+                validation_data: None,
+                on_validation: None,
+            },
+        )
+        .unwrap();
+
+        let temp_dir = temp_dir("resume-smoke");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let checkpoint = temp_dir.join("resume.ckpt");
+        save_training_checkpoint(SaveTrainingCheckpointRequest {
+            path: &checkpoint,
+            model: &artifacts.model,
+            optimizer: Some(&artifacts.optimizer),
+            tokenizer: &tokenizer,
+            chat_template: ChatTemplateKind::SimpleTranscript,
+            trained_steps: 2,
+            seed: train_config.seed,
+            run_manifest: None,
+        })
+        .unwrap();
+
+        let loaded =
+            load_training_checkpoint::<TestAutodiffBackend>(&checkpoint, &device, &train_config)
+                .unwrap();
+        let resumed_artifacts = TrainingArtifacts {
+            model: loaded.model,
+            optimizer: loaded.optimizer,
+        };
+        let (_artifacts, resumed_summary) = run_training_steps::<TestBackend, TestAutodiffBackend>(
+            resumed_artifacts,
+            TrainingRunRequest {
+                tokenizer: &tokenizer,
+                training_data: &training_data,
+                train_config: &train_config,
+                starting_step: 2,
+                device: &device,
+                profile: None,
+                capture_logs: true,
+                validation_data: None,
+                on_validation: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resumed_summary.log_entries.first().unwrap().total_step, 3);
+        assert_eq!(resumed_summary.log_entries.last().unwrap().total_step, 4);
+        assert!(resumed_summary.final_loss.is_finite());
+
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn tiny_run_supports_activation_checkpointing_backend() {
+        let dataset = Dataset::from_text("hello\n", DataFormat::Lines, false).unwrap();
+        let tokenizer = Tokenizer::from_docs(dataset.docs(), BoundaryMode::SharedBos).unwrap();
+        let training_data = TrainingData::from_dataset(
+            &dataset,
+            &tokenizer,
+            TrainMode::Auto,
+            ChatTemplateKind::SimpleTranscript,
+        )
+        .unwrap();
+        let train_config = TrainConfig {
+            steps: 2,
+            sample_every: 1,
+            batch_size: 1,
+            gradient_accumulation_steps: 1,
+            activation_checkpointing: true,
+            learning_rate: 0.05,
+            warmup_steps: 0,
+            lr_schedule: LrScheduleKind::Linear,
+            block_size: 8,
+            n_layer: 1,
+            n_embd: 16,
+            n_head: 4,
+            n_kv_head: 0,
+            ..TrainConfig::default()
+        };
+        let model_config = train_config.to_model_config(tokenizer.vocab_size());
+        let device = Default::default();
+        let artifacts = TrainingArtifacts::<TestCheckpointAutodiffBackend>::new(
+            &model_config,
+            &train_config,
+            &device,
+        )
+        .unwrap();
+
+        let (_artifacts, summary) =
+            run_training_steps::<TestBackend, TestCheckpointAutodiffBackend>(
+                artifacts,
+                TrainingRunRequest {
+                    tokenizer: &tokenizer,
+                    training_data: &training_data,
+                    train_config: &train_config,
+                    starting_step: 0,
+                    device: &device,
+                    profile: None,
+                    capture_logs: true,
+                    validation_data: None,
+                    on_validation: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(summary.log_entries.len(), 2);
+        assert!(summary.final_loss.is_finite());
     }
 }

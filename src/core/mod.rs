@@ -3,5 +3,5 @@
 
 pub mod config;
 pub mod error;
+pub mod presets;
 pub mod rng;
-pub mod tensor;

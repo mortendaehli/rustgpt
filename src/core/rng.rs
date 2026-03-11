@@ -1,5 +1,3 @@
-use std::f32::consts::PI;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Rng {
     state: [u32; 4],
@@ -60,12 +58,6 @@ impl Rng {
             let swap_idx = self.gen_range_usize(idx + 1);
             items.swap(idx, swap_idx);
         }
-    }
-
-    pub fn gauss(&mut self, std: f32) -> f32 {
-        let u1 = self.next_f32().clamp(f32::MIN_POSITIVE, 1.0 - f32::EPSILON);
-        let u2 = self.next_f32();
-        std * (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
     }
 
     pub fn sample_weighted(&mut self, weights: &[f32]) -> Option<usize> {

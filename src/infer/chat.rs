@@ -2,7 +2,7 @@ use crate::core::config::ChatTemplateKind;
 use crate::core::error::Result;
 use crate::data::schema::{Message, MessageRole, render_messages};
 use crate::data::tokenizer::Tokenizer;
-use crate::engine::generate::StopCondition;
+use crate::infer::sample::StopCondition;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChatDirective {
@@ -82,17 +82,6 @@ impl ChatSession {
         });
     }
 
-    pub fn prompt(&self) -> String {
-        let mut rendered = self.history();
-        if matches!(
-            self.turns.last().map(|turn| turn.role),
-            Some(MessageRole::User)
-        ) {
-            rendered.push_str(MessageRole::Assistant.prefix(self.template.kind()));
-        }
-        rendered
-    }
-
     pub fn prepare_prompt(
         &self,
         tokenizer: &Tokenizer,
@@ -127,7 +116,7 @@ impl ChatSession {
             }
 
             let prompt_tokens = tokenizer.encode_text(&prompt);
-            if prompt_tokens.len() + 1 <= max_prompt_tokens
+            if prompt_tokens.len() < max_prompt_tokens
                 || dropped_turns >= self.turns.len().saturating_sub(1)
             {
                 let prompt_tokens = if prompt_tokens.len() <= allowed_prompt_tokens {

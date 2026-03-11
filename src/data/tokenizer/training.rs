@@ -72,7 +72,7 @@ fn train_bpe_tokenizer(
     let mut tokenizer = TokenizerBuilder::new()
         .with_model(model)
         .with_normalizer(Some(NFC))
-        .with_pre_tokenizer(Some(byte_level.clone()))
+        .with_pre_tokenizer(Some(byte_level))
         .with_post_processor(Some(byte_level))
         .with_decoder(Some(ByteLevelDecoder::default()))
         .build()

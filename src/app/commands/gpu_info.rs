@@ -1,7 +1,7 @@
 use crate::app::cli::GpuInfoCommand;
 use crate::core::config::DeviceKind;
 use crate::core::error::Result;
-use crate::engine::device::gpu_adapter_info;
+use crate::runtime::device::gpu_adapter_info;
 
 pub fn run_gpu_info(command: GpuInfoCommand) -> Result<()> {
     println!("RustGPT gpu-info");

@@ -9,17 +9,19 @@ pub fn run_prepare_data(command: PrepareDataCommand) -> Result<()> {
         &dataset,
         command.data.chat_template,
         &command.prepare.output_path,
-        command.prepare.output_format,
-        command.prepare.pretty,
+        &command.prepare,
     )?;
 
     println!(
-        "RustGPT prepare-data  in={}  in_format={}  out={}  out_format={}  records={}",
+        "RustGPT prepare-data  in={}  in_format={}  out={}  out_format={}  input_records={}  written_records={}  deduped={}  quality_filtered={}",
         command.data.data_path.display(),
         command.data.format,
         summary.output_path.display(),
         summary.output_format,
-        summary.records
+        summary.input_records,
+        summary.records,
+        summary.duplicate_records_removed,
+        summary.quality_filtered_records,
     );
     Ok(())
 }

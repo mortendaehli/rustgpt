@@ -3,6 +3,7 @@
 //! tokenization and training-example construction.
 
 use std::borrow::Cow;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,16 +21,6 @@ pub enum MessageRole {
 }
 
 impl MessageRole {
-    pub fn from_str(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "system" => Some(Self::System),
-            "user" => Some(Self::User),
-            "assistant" => Some(Self::Assistant),
-            "tool" => Some(Self::Tool),
-            _ => None,
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Self::System => "system",
@@ -53,6 +44,20 @@ impl MessageRole {
                 Self::Assistant => "<|assistant|>\n",
                 Self::Tool => "<|tool|>\n",
             },
+        }
+    }
+}
+
+impl FromStr for MessageRole {
+    type Err = ();
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "system" => Ok(Self::System),
+            "user" => Ok(Self::User),
+            "assistant" => Ok(Self::Assistant),
+            "tool" => Ok(Self::Tool),
+            _ => Err(()),
         }
     }
 }
@@ -111,7 +116,7 @@ impl DatasetRecord {
                     .messages
                     .iter()
                     .map(|message| Message {
-                        role: message.role.clone(),
+                        role: message.role,
                         content: message.content.to_lowercase(),
                     })
                     .collect(),
@@ -119,10 +124,6 @@ impl DatasetRecord {
                 meta: record.meta.clone(),
             }),
         }
-    }
-
-    pub fn byte_len(&self) -> usize {
-        self.rendered_text().len()
     }
 }
 
@@ -212,7 +213,7 @@ fn parse_message_value(value: Value) -> Result<Message> {
         RustGptError::Data("chat message is missing string field `role`".to_string())
     })?;
     let role = MessageRole::from_str(&role_raw)
-        .ok_or_else(|| RustGptError::Data(format!("unsupported chat role {role_raw:?}")))?;
+        .map_err(|_| RustGptError::Data(format!("unsupported chat role {role_raw:?}")))?;
 
     let content = map
         .remove("content")

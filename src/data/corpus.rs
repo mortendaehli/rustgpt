@@ -103,14 +103,6 @@ impl Dataset {
         self.records.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
-    }
-
-    pub fn total_bytes(&self) -> usize {
-        self.total_bytes
-    }
-
     pub fn total_bytes_with_template(&self, template: ChatTemplateKind) -> usize {
         self.records
             .iter()
@@ -200,7 +192,7 @@ impl Dataset {
         Self::from_records(format, records)
     }
 
-    fn from_records(format: DataFormat, records: Vec<DatasetRecord>) -> Result<Self> {
+    pub(crate) fn from_records(format: DataFormat, records: Vec<DatasetRecord>) -> Result<Self> {
         if records.is_empty() {
             return Err(RustGptError::Data(
                 "dataset is empty after preprocessing".to_string(),

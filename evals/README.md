@@ -2,6 +2,12 @@ Checked-in prompt-eval suites for `cargo run -- eval`.
 
 Use the suite that matches the checkpoint chat template:
 
+- [instruction_following_simple.jsonl](/Users/mortendaehliaslesen/RustroverProjects/rustgpt/evals/instruction_following_simple.jsonl)
+- [instruction_following_chatml.jsonl](/Users/mortendaehliaslesen/RustroverProjects/rustgpt/evals/instruction_following_chatml.jsonl)
+- [retention_simple.jsonl](/Users/mortendaehliaslesen/RustroverProjects/rustgpt/evals/retention_simple.jsonl)
+- [retention_chatml.jsonl](/Users/mortendaehliaslesen/RustroverProjects/rustgpt/evals/retention_chatml.jsonl)
+- [repetition_simple.jsonl](/Users/mortendaehliaslesen/RustroverProjects/rustgpt/evals/repetition_simple.jsonl)
+- [repetition_chatml.jsonl](/Users/mortendaehliaslesen/RustroverProjects/rustgpt/evals/repetition_chatml.jsonl)
 - [assistant_termination_simple.jsonl](/Users/mortendaehliaslesen/RustroverProjects/rustgpt/evals/assistant_termination_simple.jsonl)
 - [assistant_termination_chatml.jsonl](/Users/mortendaehliaslesen/RustroverProjects/rustgpt/evals/assistant_termination_chatml.jsonl)
 

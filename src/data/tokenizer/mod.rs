@@ -16,7 +16,7 @@ use crate::core::error::{Result, RustGptError};
 
 pub(crate) use self::byte::ByteTokenizer;
 pub(crate) use self::hf::HfTokenizer;
-pub use self::training::{TokenizerTrainingSummary, train_tokenizer_from_dataset};
+pub use self::training::train_tokenizer_from_dataset;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TokenSymbol {
@@ -40,7 +40,7 @@ impl Display for TokenSymbol {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TokenizerImpl {
-    Byte(ByteTokenizer),
+    Byte(Box<ByteTokenizer>),
     HuggingFace(HfTokenizer),
 }
 
@@ -52,7 +52,7 @@ pub struct Tokenizer {
 impl Tokenizer {
     pub fn from_docs(docs: &[String], boundary_mode: BoundaryMode) -> Result<Self> {
         Ok(Self {
-            inner: TokenizerImpl::Byte(ByteTokenizer::from_docs(docs, boundary_mode)?),
+            inner: TokenizerImpl::Byte(Box::new(ByteTokenizer::from_docs(docs, boundary_mode)?)),
         })
     }
 
@@ -68,7 +68,7 @@ impl Tokenizer {
 
     pub(crate) fn from_checkpoint_symbols(symbols: Vec<TokenSymbol>) -> Result<Self> {
         Ok(Self {
-            inner: TokenizerImpl::Byte(ByteTokenizer::from_symbols(symbols)?),
+            inner: TokenizerImpl::Byte(Box::new(ByteTokenizer::from_symbols(symbols)?)),
         })
     }
 

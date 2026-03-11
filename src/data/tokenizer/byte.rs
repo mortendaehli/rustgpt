@@ -31,8 +31,8 @@ impl ByteTokenizer {
             .map(|byte| TokenSymbol::Byte(byte as u8))
             .collect::<Vec<_>>();
         let mut byte_to_id = [usize::MAX; BYTE_VOCAB_SIZE];
-        for byte in 0..BYTE_VOCAB_SIZE {
-            byte_to_id[byte] = byte;
+        for (byte, slot) in byte_to_id.iter_mut().enumerate().take(BYTE_VOCAB_SIZE) {
+            *slot = byte;
         }
 
         let bos_id = id_to_symbol.len();

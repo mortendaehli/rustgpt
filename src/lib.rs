@@ -1,14 +1,20 @@
 #![recursion_limit = "256"]
 
 //! RustGPT is organized into a few maintainable research-oriented layers:
-//! `app` for CLI entrypoints, `core` for reusable primitives,
-//! `data` for corpora/tokenizers/checkpoints, and `engine`
-//! for the Burn-backed language model runtime.
+//! `app` for CLI entrypoints, `core` for shared types and errors,
+//! `data` for corpora/tokenizers/training examples,
+//! `model` for the decoder-only transformer,
+//! `train` for optimization and validation,
+//! `infer` for sampling/chat, and `runtime`
+//! for device/checkpoint/profile concerns.
 
-pub mod app;
-pub mod core;
-pub mod data;
-pub mod engine;
+mod app;
+mod core;
+mod data;
+mod infer;
+mod model;
+mod runtime;
+mod train;
 
 use crate::core::error::Result;
 

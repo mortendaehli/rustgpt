@@ -467,7 +467,7 @@ mod tests {
             build_chat_example(&tokenizer, &chat, true, ChatTemplateKind::SimpleTranscript)
                 .unwrap();
         assert!(example.loss_mask.iter().any(|weight| *weight > 0.0));
-        assert!(example.loss_mask.iter().any(|weight| *weight == 0.0));
+        assert!(example.loss_mask.contains(&0.0));
     }
 
     #[test]

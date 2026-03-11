@@ -9,10 +9,10 @@ use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder, RecorderErr
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use serde::{Deserialize, Serialize};
 
-use crate::core::config::{BoundaryMode, ChatTemplateKind, ModelConfig};
+use crate::core::config::{BoundaryMode, ChatTemplateKind, DataFormat, ModelConfig, TrainConfig};
 use crate::core::error::{Result, RustGptError};
 use crate::data::tokenizer::{TokenSymbol, Tokenizer};
-use crate::engine::model::{LanguageModel, LanguageModelOptimizer, build_optimizer};
+use crate::model::lm::{LanguageModel, LanguageModelOptimizer, build_optimizer};
 
 const CHECKPOINT_VERSION: u32 = 2;
 
@@ -23,6 +23,7 @@ pub struct CheckpointMetadata {
     pub trained_steps: usize,
     pub seed: u64,
     pub chat_template: ChatTemplateKind,
+    pub run_manifest: Option<CheckpointRunManifest>,
 }
 
 #[derive(Debug)]
@@ -30,17 +31,23 @@ pub struct LoadedCheckpoint<B: Backend> {
     pub model: LanguageModel<B>,
     pub tokenizer: Tokenizer,
     pub trained_steps: usize,
-    pub seed: u64,
     pub chat_template: ChatTemplateKind,
 }
 
 pub struct LoadedTrainingCheckpoint<AD: AutodiffBackend> {
     pub model: LanguageModel<AD>,
     pub optimizer: LanguageModelOptimizer<AD>,
-    pub tokenizer: Tokenizer,
+}
+
+pub struct SaveTrainingCheckpointRequest<'a, AD: AutodiffBackend> {
+    pub path: &'a Path,
+    pub model: &'a LanguageModel<AD>,
+    pub optimizer: Option<&'a LanguageModelOptimizer<AD>>,
+    pub tokenizer: &'a Tokenizer,
+    pub chat_template: ChatTemplateKind,
     pub trained_steps: usize,
     pub seed: u64,
-    pub chat_template: ChatTemplateKind,
+    pub run_manifest: Option<CheckpointRunManifest>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -51,6 +58,24 @@ struct CheckpointManifest {
     trained_steps: usize,
     seed: u64,
     chat_template: ChatTemplateKind,
+    #[serde(default)]
+    run_manifest: Option<CheckpointRunManifest>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CheckpointRunManifest {
+    pub saved_at_ms: u64,
+    pub train_config: TrainConfig,
+    pub training_data_path: PathBuf,
+    pub training_data_format: DataFormat,
+    pub validation_data_path: Option<PathBuf>,
+    pub validation_data_format: Option<DataFormat>,
+    pub resolved_device: String,
+    pub final_loss: Option<f32>,
+    pub validation_loss: Option<f32>,
+    pub best_validation_loss: Option<f32>,
+    pub total_tokens: Option<usize>,
+    pub average_tokens_per_second: Option<f32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -87,7 +112,6 @@ pub fn load_inference_checkpoint<B: Backend>(
         model,
         tokenizer: metadata.tokenizer,
         trained_steps: metadata.trained_steps,
-        seed: metadata.seed,
         chat_template: metadata.chat_template,
     })
 }
@@ -113,26 +137,22 @@ pub fn load_training_checkpoint<AD: AutodiffBackend>(
         Err(err) => return Err(checkpoint_error(path, err)),
     }
 
-    Ok(LoadedTrainingCheckpoint {
-        model,
-        optimizer,
-        tokenizer: metadata.tokenizer,
-        trained_steps: metadata.trained_steps,
-        seed: metadata.seed,
-        chat_template: metadata.chat_template,
-    })
+    Ok(LoadedTrainingCheckpoint { model, optimizer })
 }
 
 pub fn save_training_checkpoint<AD: AutodiffBackend>(
-    path: impl AsRef<Path>,
-    model: &LanguageModel<AD>,
-    optimizer: Option<&LanguageModelOptimizer<AD>>,
-    tokenizer: &Tokenizer,
-    chat_template: ChatTemplateKind,
-    trained_steps: usize,
-    seed: u64,
+    request: SaveTrainingCheckpointRequest<'_, AD>,
 ) -> Result<()> {
-    let path = path.as_ref();
+    let SaveTrainingCheckpointRequest {
+        path,
+        model,
+        optimizer,
+        tokenizer,
+        chat_template,
+        trained_steps,
+        seed,
+        run_manifest,
+    } = request;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| RustGptError::io_with_path(parent, source))?;
     }
@@ -144,6 +164,7 @@ pub fn save_training_checkpoint<AD: AutodiffBackend>(
         trained_steps,
         seed,
         chat_template,
+        run_manifest,
     };
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|err| {
         RustGptError::Checkpoint(format!(
@@ -254,6 +275,7 @@ fn checkpoint_metadata_from_manifest(manifest: CheckpointManifest) -> Result<Che
         trained_steps: manifest.trained_steps,
         seed: manifest.seed,
         chat_template: manifest.chat_template,
+        run_manifest: manifest.run_manifest,
     })
 }
 
@@ -352,10 +374,11 @@ mod tests {
 
     use crate::core::config::{BoundaryMode, ChatTemplateKind, ModelConfig, TrainConfig};
     use crate::data::tokenizer::Tokenizer;
-    use crate::engine::model::{LanguageModel, build_optimizer};
+    use crate::model::lm::{LanguageModel, build_optimizer};
 
     use super::{
-        CHECKPOINT_VERSION, load_training_checkpoint, model_record_base, optimizer_record_base,
+        CHECKPOINT_VERSION, CheckpointRunManifest, SaveTrainingCheckpointRequest,
+        load_training_checkpoint, model_record_base, optimizer_record_base,
         read_checkpoint_metadata, record_file_path, save_training_checkpoint,
     };
 
@@ -417,31 +440,56 @@ mod tests {
             LanguageModel::<TestAutodiffBackend>::new(model_config.clone(), &device).unwrap();
         let optimizer = build_optimizer::<TestAutodiffBackend>(&TrainConfig::default());
 
-        save_training_checkpoint(
-            &checkpoint,
-            &model,
-            Some(&optimizer),
-            &tokenizer,
-            ChatTemplateKind::SimpleTranscript,
-            12,
-            7,
-        )
+        save_training_checkpoint(SaveTrainingCheckpointRequest {
+            path: &checkpoint,
+            model: &model,
+            optimizer: Some(&optimizer),
+            tokenizer: &tokenizer,
+            chat_template: ChatTemplateKind::SimpleTranscript,
+            trained_steps: 12,
+            seed: 7,
+            run_manifest: Some(CheckpointRunManifest {
+                saved_at_ms: 123,
+                train_config: TrainConfig::default(),
+                training_data_path: PathBuf::from("train.txt"),
+                training_data_format: crate::core::config::DataFormat::Lines,
+                validation_data_path: Some(PathBuf::from("valid.txt")),
+                validation_data_format: Some(crate::core::config::DataFormat::Lines),
+                resolved_device: "cpu".to_string(),
+                final_loss: Some(1.25),
+                validation_loss: Some(1.5),
+                best_validation_loss: Some(1.5),
+                total_tokens: Some(1024),
+                average_tokens_per_second: Some(2048.0),
+            }),
+        })
         .unwrap();
 
         let metadata = read_checkpoint_metadata(&checkpoint).unwrap();
         assert_eq!(metadata.model_config, model_config);
         assert_eq!(metadata.trained_steps, 12);
         assert_eq!(metadata.seed, 7);
+        assert_eq!(
+            metadata
+                .run_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.total_tokens),
+            Some(1024)
+        );
+        assert_eq!(
+            metadata
+                .run_manifest
+                .as_ref()
+                .map(|manifest| manifest.training_data_path.clone()),
+            Some(PathBuf::from("train.txt"))
+        );
 
-        let loaded = load_training_checkpoint::<TestAutodiffBackend>(
+        let _loaded = load_training_checkpoint::<TestAutodiffBackend>(
             &checkpoint,
             &device,
             &TrainConfig::default(),
         )
         .unwrap();
-        assert_eq!(loaded.trained_steps, 12);
-        assert_eq!(loaded.seed, 7);
-        assert_eq!(loaded.chat_template, ChatTemplateKind::SimpleTranscript);
 
         fs::remove_file(&checkpoint).ok();
         fs::remove_file(record_file_path(&model_record_base(&checkpoint))).ok();

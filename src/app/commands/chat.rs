@@ -5,12 +5,13 @@ use burn::tensor::backend::Backend;
 use crate::app::cli::ChatCommand;
 use crate::core::error::Result;
 use crate::core::rng::Rng;
-use crate::engine::chat::{ChatDirective, ChatSession, parse_chat_directive};
-use crate::engine::checkpoint::load_inference_checkpoint;
-use crate::engine::device::{CpuBackend, GpuBackend, ResolvedDeviceKind, cpu_device, gpu_device};
-use crate::engine::generate::{
-    SamplingStrategy, generate_completion_from_tokens, generate_completion_streaming,
+use crate::infer::chat::{ChatDirective, ChatSession, parse_chat_directive};
+use crate::infer::sample::{
+    GenerationConfig, SamplingStrategy, generate_completion_from_tokens,
+    generate_completion_streaming,
 };
+use crate::runtime::checkpoint::load_inference_checkpoint;
+use crate::runtime::device::{CpuBackend, GpuBackend, ResolvedDeviceKind, cpu_device, gpu_device};
 
 pub fn run_chat(command: ChatCommand) -> Result<()> {
     let resolved = ResolvedDeviceKind::resolve(command.chat.device)?;
@@ -82,6 +83,12 @@ fn run_chat_impl<B: Backend>(
                 prepared_prompt.dropped_turns
             );
         }
+        let generation = GenerationConfig {
+            max_new_tokens: command.chat.max_new_tokens,
+            strategy: &strategy,
+            stop_condition: &prepared_prompt.stop_condition,
+            profile: None,
+        };
         let reply = if command.chat.stream {
             print!("assistant> ");
             io::stdout().flush()?;
@@ -93,10 +100,7 @@ fn run_chat_impl<B: Backend>(
                 &checkpoint.model,
                 &checkpoint.tokenizer,
                 &prepared_prompt.prompt_tokens,
-                command.chat.max_new_tokens,
-                &strategy,
-                &prepared_prompt.stop_condition,
-                None,
+                &generation,
                 &mut rng,
                 &mut stream_stdout,
             )?;
@@ -107,10 +111,7 @@ fn run_chat_impl<B: Backend>(
                 &checkpoint.model,
                 &checkpoint.tokenizer,
                 &prepared_prompt.prompt_tokens,
-                command.chat.max_new_tokens,
-                &strategy,
-                &prepared_prompt.stop_condition,
-                None,
+                &generation,
                 &mut rng,
             )?;
             println!("assistant> {}", reply);
@@ -164,7 +165,7 @@ fn read_user_message(stdin: &io::Stdin) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
-    use crate::engine::chat::{ChatDirective, parse_chat_directive};
+    use crate::infer::chat::{ChatDirective, parse_chat_directive};
 
     #[test]
     fn directives_are_detected_before_multiline_collection() {

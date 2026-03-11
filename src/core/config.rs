@@ -270,6 +270,8 @@ impl Default for DataConfig {
 pub struct TrainConfig {
     pub steps: usize,
     pub batch_size: usize,
+    pub gradient_accumulation_steps: usize,
+    pub activation_checkpointing: bool,
     pub learning_rate: f32,
     pub beta1: f32,
     pub beta2: f32,
@@ -301,6 +303,8 @@ impl Default for TrainConfig {
         Self {
             steps: 1_000,
             batch_size: 1,
+            gradient_accumulation_steps: 1,
+            activation_checkpointing: false,
             learning_rate: 0.01,
             beta1: 0.85,
             beta2: 0.99,
@@ -415,6 +419,11 @@ pub struct PrepareDataConfig {
     pub output_path: PathBuf,
     pub output_format: DataFormat,
     pub pretty: bool,
+    pub dedup: bool,
+    pub min_chars: usize,
+    pub max_chars: usize,
+    pub min_messages: usize,
+    pub require_assistant: bool,
 }
 
 impl Default for PrepareDataConfig {
@@ -423,6 +432,11 @@ impl Default for PrepareDataConfig {
             output_path: PathBuf::from("prepared.jsonl"),
             output_format: DataFormat::JsonlText,
             pretty: false,
+            dedup: false,
+            min_chars: 0,
+            max_chars: 0,
+            min_messages: 0,
+            require_assistant: false,
         }
     }
 }
@@ -523,20 +537,6 @@ pub struct ModelConfig {
     pub activation: ActivationKind,
     pub position_encoding: PositionEncodingKind,
     pub boundary_mode: BoundaryMode,
-}
-
-impl ModelConfig {
-    pub fn head_dim(&self) -> usize {
-        self.n_embd / self.n_head
-    }
-
-    pub fn kv_dim(&self) -> usize {
-        self.n_kv_head * self.head_dim()
-    }
-
-    pub fn query_heads_per_kv_head(&self) -> usize {
-        self.n_head / self.n_kv_head
-    }
 }
 
 impl TrainConfig {

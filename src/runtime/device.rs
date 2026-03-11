@@ -1,3 +1,4 @@
+use burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing;
 use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, NdArray, Wgpu, ndarray::NdArrayDevice};
 use wgpu::{
@@ -10,8 +11,10 @@ use crate::core::error::{Result, RustGptError};
 
 pub type CpuBackend = NdArray<f32>;
 pub type CpuAutodiffBackend = Autodiff<CpuBackend>;
+pub type CpuCheckpointAutodiffBackend = Autodiff<CpuBackend, BalancedCheckpointing>;
 pub type GpuBackend = Wgpu<f32, i32>;
 pub type GpuAutodiffBackend = Autodiff<GpuBackend>;
+pub type GpuCheckpointAutodiffBackend = Autodiff<GpuBackend, BalancedCheckpointing>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolvedDeviceKind {

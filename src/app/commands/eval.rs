@@ -6,10 +6,12 @@ use crate::core::rng::Rng;
 use crate::data::corpus::Dataset;
 use crate::data::eval_suite::{PromptEvalCase, load_prompt_eval_suite};
 use crate::data::training_data::TrainingData;
-use crate::engine::checkpoint::load_inference_checkpoint;
-use crate::engine::device::{CpuBackend, GpuBackend, ResolvedDeviceKind, cpu_device, gpu_device};
-use crate::engine::generate::{SamplingStrategy, StopCondition, generate_completion};
-use crate::engine::train::evaluate_training_data;
+use crate::infer::sample::{
+    GenerationConfig, SamplingStrategy, StopCondition, generate_completion,
+};
+use crate::runtime::checkpoint::load_inference_checkpoint;
+use crate::runtime::device::{CpuBackend, GpuBackend, ResolvedDeviceKind, cpu_device, gpu_device};
+use crate::train::training::evaluate_training_data;
 
 pub fn run_eval(command: EvalCommand) -> Result<()> {
     let resolved = ResolvedDeviceKind::resolve(command.eval.device)?;
@@ -95,15 +97,18 @@ fn run_eval_impl<B: Backend>(
     if !prompt_cases.is_empty() {
         let mut rng = Rng::from_seed(42);
         let mut failed_cases = Vec::new();
+        let stop_condition = StopCondition::none();
         for (prompt_idx, case) in prompt_cases.iter().enumerate() {
             let completion = generate_completion(
                 &checkpoint.model,
                 &checkpoint.tokenizer,
                 &case.prompt,
-                case.max_new_tokens.unwrap_or(command.eval.max_new_tokens),
-                &strategy,
-                &StopCondition::none(),
-                None,
+                &GenerationConfig {
+                    max_new_tokens: case.max_new_tokens.unwrap_or(command.eval.max_new_tokens),
+                    strategy: &strategy,
+                    stop_condition: &stop_condition,
+                    profile: None,
+                },
                 &mut rng,
             )?;
             let failures = check_prompt_case(&completion, case);

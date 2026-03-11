@@ -1,777 +1,227 @@
 # RustGPT Architecture
 
-## Purpose
+RustGPT is a single educational codebase for a modern small LLM on Apple Silicon.
 
-This document describes the target architecture for the Rust GPT codebase and how it should evolve from a compact educational implementation into a broader research and experimentation platform.
+This document describes the supported mainline architecture that students should learn from. If something is not described here, it should be treated as out of scope for the main teaching path.
 
-The architecture has three horizons:
+## Design Goals
 
-1. A compact local GPT training and inference engine.
-2. A flexible runtime that can support more modern LLM patterns.
-3. A research system that can propose, run, evaluate, and safely promote improvements.
+The architecture is optimized for teaching, not for frontier benchmarking.
 
-The third horizon must be designed carefully. "Self-improving" should not mean unbounded self-modification. It should mean controlled, auditable, test-gated iteration.
+The goals are:
 
-## Architectural Goals
+- one clean modern dense LLM path
+- clear module boundaries
+- truthful implementation with no “planned but not implemented” surfaces
+- code that can be read top-down by third-year systems students
+- runs that fit an M5 MacBook Pro with `16 GB` unified memory
 
-- Keep the core model engine understandable and debuggable.
-- Separate pure model logic from data, CLI, checkpointing, and future research automation.
-- Support incremental adoption of modern transformer features.
-- Support reproducible experiments and safe rollback.
-- Allow a future terminal chat interface without forking the model runtime.
-- Allow a future research loop without granting the model direct, unchecked authority over the codebase.
+## Supported Architecture
 
-## Design Principles
+The mainline implementation supports one architecture family:
 
-### 1. Separate the model kernel from orchestration
+- dense decoder-only causal Transformer
+- BPE tokenizer or external `tokenizer.json`
+- pre-norm `RMSNorm`
+- causal self-attention with standard multi-head attention or grouped-query attention
+- `RoPE` or learned absolute positions
+- `SwiGLU`, `GELU`, or `ReLU` MLP
+- tied or untied LM head
+- `AdamW` with warmup, cosine or linear decay, and gradient clipping
+- gradient accumulation and optional activation checkpointing
+- checkpointed training, evaluation, sampling, and terminal chat
 
-The tensor math, model parameters, forward pass, backward pass, optimizer, and sampling logic should live in a stable core. Training workflows, evaluation pipelines, chat interfaces, and automated experimentation should depend on that core instead of reimplementing it.
+The mainline intentionally does not include:
 
-### 2. Build a narrow waist
+- scratch tensor or matrix training paths
+- MoE
+- sparse or local attention
+- long-context tricks beyond classroom-sized context windows
+- RLHF or RLVR
+- CLI flags for features that are not implemented
 
-The most important interface in the system is the model runtime boundary:
+## End-To-End Flow
 
-- input token IDs
-- model config
-- checkpoint state
-- output logits, losses, gradients, and samples
+The main learning flow is:
 
-If this interface is clean, almost everything else can evolve independently.
+1. raw documents or chat records are loaded in `data`
+2. `data` normalizes them and turns them into training sequences
+3. `model` maps token IDs to logits
+4. `train` computes weighted next-token loss and updates parameters
+5. `runtime` saves checkpoints and resolves devices
+6. `infer` reuses the same model for sampling and chat
+7. `app` only wires the whole system to the CLI
 
-### 3. Prefer compatibility layers over branching implementations
+This is the key architectural rule in the repo:
 
-The system should avoid maintaining:
+- `model` should not know about files, CLI, or datasets
+- `data` should not know about optimizer logic
+- `train` should not implement model internals
+- `app` should not contain reusable ML logic
 
-- one codepath for training
-- another for sampling
-- another for chat
-
-Instead, it should expose one model engine with small wrapper layers.
-
-### 4. Treat research automation as a separate control plane
-
-The future research system should not be embedded directly inside the trusted model kernel. It should operate outside the core as an orchestrator that proposes experiments, runs them in isolation, and promotes results only when they pass explicit gates.
-
-## High-Level Architecture
+## Module Boundaries
 
 ```text
-                +---------------------------+
-                |       Terminal CLI        |
-                | train | sample | chat     |
-                +------------+--------------+
-                             |
-                             v
-                +---------------------------+
-                |    Application Layer      |
-                | config | commands | I/O   |
-                +------------+--------------+
-                             |
-            +----------------+----------------+
-            |                                 |
-            v                                 v
- +-------------------------+       +-------------------------+
- |    Data/Tokenizer       |       |    Checkpoint Layer     |
- | corpus | vocab | encode |       | save | load | version   |
- +------------+------------+       +------------+------------+
-              |                                 |
-              +----------------+----------------+
-                               |
-                               v
-                   +-------------------------+
-                   |      Model Runtime      |
-                   | forward | backward      |
-                   | optimize | sample       |
-                   +------------+------------+
-                                |
-                                v
-                   +-------------------------+
-                   |   Math / Tensor Kernel  |
-                   | vecs | matrices | RNG   |
-                   +-------------------------+
+src/
+  app/        CLI and command wiring
+  data/       datasets, schemas, tokenization, training examples
+  model/      decoder-only transformer implementation
+  train/      optimizer config, training loop, validation, metrics
+  infer/      sampling, stop conditions, chat session logic
+  runtime/    checkpointing, device selection, profiling
+  core/       shared config, error, and RNG utilities
 ```
 
-## Layer-by-Layer Description
-
-## 1. Math / Tensor Kernel
-
-This is the lowest layer and should remain small and explicit.
+### `app`
 
 Responsibilities:
 
-- matrix and vector storage
-- low-level ops such as `linear`, `softmax`, `rmsnorm`
-- activation functions
-- RNG and Gaussian initialization
-- numerical helpers
+- parse CLI arguments
+- dispatch commands
+- print progress and summaries
 
 Rules:
 
-- no business logic
-- no tokenizer logic
-- no CLI concerns
-- keep data layout explicit
+- no reusable ML logic
+- no duplicated model behavior
 
-Why it matters:
-
-If this layer stays simple, optimization and correctness work remain tractable.
-
-## 2. Model Runtime
-
-This is the heart of the system.
+### `data`
 
 Responsibilities:
 
-- parameter initialization
-- token embedding and positional embedding
-- transformer layers
-- causal attention with KV cache
-- forward cache creation
-- analytical backward pass
-- optimizer updates
-- autoregressive sampling
+- load `lines`, `text`, `jsonl-*`, and `parquet-*`
+- normalize text and chat records
+- train or load tokenizers
+- convert normalized records into token IDs and loss masks
 
-Key interfaces:
+Rules:
 
-- `forward_token(...) -> TokenForwardCache`
-- `backward_token(...) -> gradients`
-- `train_step(...) -> loss`
-- `sample(...) -> token stream`
+- the output of this layer is token-oriented, not string-oriented
+- chat formatting belongs here or in `infer`, never in `model`
 
-Why it matters:
-
-Every higher-level feature depends on this layer being correct and stable.
-
-## 3. Data and Tokenization
+### `model`
 
 Responsibilities:
 
-- load corpora
-- normalize data where configured
-- build vocabularies
-- encode and decode tokens
-- support multiple dataset formats over time
-
-Near-term formats:
-
-- line-delimited documents
-- plain text chunking
-
-Later formats:
-
-- prompt-response pairs
-- chat transcripts
-- tool traces
-- code corpora
-- research logs and experiment summaries
-
-Key architectural rule:
-
-Tokenization must not be hardcoded inside the model runtime. The model only consumes integer token IDs.
-
-## 4. Checkpoint Layer
-
-Responsibilities:
-
-- persist model parameters
-- persist optimizer state
-- persist tokenizer metadata
-- persist configuration and training step
-- support checkpoint versioning
-
-Future responsibilities:
-
-- support model family upgrades
-- support migration tools
-- support storing evaluation summaries with each checkpoint
-
-Architectural rule:
-
-Checkpoints are the handoff format between training, sampling, chat, and research orchestration.
-
-## 5. Application Layer
-
-Responsibilities:
-
-- command routing
-- argument parsing
-- logging
-- progress output
-- wiring config and runtime together
-
-Commands expected over time:
-
-- `train`
-- `sample`
-- `resume`
-- `inspect-vocab`
-- `chat`
-- `eval`
-- `research`
-
-The application layer should remain thin. If logic becomes reusable, move it down into the library.
-
-## Core Runtime Flows
-
-## Training flow
-
-```text
-dataset -> tokenizer -> token sequence
-       -> forward pass over sequence with KV cache
-       -> loss aggregation
-       -> reverse-time backward pass with KV gradient accumulation
-       -> optimizer update
-       -> metrics + optional checkpoint
-```
-
-## Sampling flow
-
-```text
-checkpoint -> tokenizer -> BOS/prompt tokens
-          -> iterative forward pass with growing KV cache
-          -> logits -> temperature/sample strategy
-          -> next token
-          -> stop on EOS or max length
-```
-
-## Chat flow
-
-```text
-chat history -> prompt formatter -> tokens
-             -> context truncation
-             -> sampling loop
-             -> streamed or buffered response
-             -> updated chat history
-```
-
-## Recommended Near-Term Module Boundaries
-
-While the codebase remains small, keep a single crate with modular files. When growth justifies it, split into a workspace.
-
-### Single-crate stage
-
-```text
-rustgpt/
-  src/
-    lib.rs
-    cli.rs
-    config.rs
-    tokenizer.rs
-    data.rs
-    model.rs
-    forward.rs
-    backward.rs
-    optim.rs
-    checkpoint.rs
-    sample.rs
-    train.rs
-```
-
-### Future workspace stage
-
-```text
-crates/
-  core/         # model runtime and math kernel
-  cli/          # terminal application
-  evals/        # evaluation harnesses and benchmark tasks
-  research/     # experiment planner/orchestrator
-  formats/      # checkpoint and dataset schema tools
-```
-
-Do not split into a workspace immediately. Split only when module boundaries harden and multiple binaries or services appear.
-
-## Expansion Path to More Modern LLM Architecture
-
-The current baseline is intentionally simple. The architecture should allow the following upgrades without rewriting the system.
-
-## Tokenization upgrades
-
-Current:
-
-- byte-level tokenizer with BOS/EOS support
-
-Next:
-
-- BPE tokenizer
-- reserved control tokens
-- role tags for chat
-
-Architectural impact:
-
-- tokenizer interface must return token IDs and metadata
-- checkpoint must store tokenizer version and vocabulary
-
-## Embedding and positional upgrades
-
-Current:
-
-- learned token embeddings
-- learned positional embeddings
-
-Next:
-
-- separate `BOS` and `EOS`
-- rotary embeddings
-- ALiBi
-- longer context support
-
-Architectural impact:
-
-- positional logic should live in a dedicated component, not be fused into token embedding code
-
-## Transformer block upgrades
-
-Current:
-
-- RMSNorm
+- token embeddings
+- optional learned position embeddings
+- RoPE application
 - causal self-attention
-- plain ReLU MLP
-- residual connections
+- grouped-query attention when `n_kv_head < n_head`
+- feed-forward blocks
+- decoder stack
+- KV-cache aware inference
 
-Next:
+Rules:
 
-- GeLU
-- SwiGLU
-- gated MLP blocks
-- pre-norm or post-norm variants
-- residual scaling
-- dropout in train mode
-- bias toggles
+- no file I/O
+- no CLI concerns
+- no dataset loading
 
-Architectural impact:
+### `train`
 
-- block config should be explicit
-- activation functions should be swappable by enum/config, not by copy-paste
+Responsibilities:
 
-## Attention upgrades
+- prepare training runs from configs and datasets
+- build batches
+- compute weighted cross-entropy loss
+- step the optimizer
+- run validation
+- produce logs and summaries
 
-Current:
+Rules:
 
-- full causal attention over all prior positions
-- multi-head attention
+- consume `model` and `data`
+- use `runtime` for checkpoints and device handling
 
-Next:
+### `infer`
 
-- grouped-query attention
-- multi-query attention
-- sliding-window attention
-- paged KV cache
-- more efficient attention kernels
+Responsibilities:
 
-Architectural impact:
+- next-token sampling
+- stop conditions
+- prompt truncation
+- chat session state
 
-- keep KV cache as an explicit structure
-- do not hardcode one cache layout forever
+Rules:
 
-## Optimization and training upgrades
+- reuse the same `model` path as training
+- keep sampling policy separate from CLI concerns
 
-Current:
+### `runtime`
 
-- Adam
-- batch size = 1
-- full precision `f32`
+Responsibilities:
 
-Next:
+- CPU and GPU device resolution
+- checkpoint save and load
+- runtime profiling
 
-- minibatching
-- gradient accumulation
-- mixed precision
-- gradient clipping
-- learning-rate schedulers
-- weight decay
-- sequence packing
-- curriculum learning
+Rules:
 
-Architectural impact:
+- runtime concerns should not leak model semantics into other layers
 
-- optimizer state should be modular
-- training loop should be separate from model math
+## Training Modes
 
-## Adaptation and finetuning upgrades
+There are two supported training modes in the teaching path:
 
-Future:
+- pretraining: next-token prediction over plain text
+- SFT: next-token prediction over chat transcripts, with assistant-only loss masking
 
+Students should notice that the optimizer and the model stay the same across both modes. What changes is the data representation and the loss mask.
+
+## Key Invariants
+
+These are important invariants students should rely on when reading or modifying the code:
+
+- the same `LanguageModel` implementation is used for training and inference
+- checkpoints are the boundary between runs and include model config plus tokenizer state
+- `n_embd` must be divisible by `n_head`
+- grouped-query attention is valid only when `n_kv_head` divides `n_head`
+- RoPE requires an even head dimension
+- presets are meant to be safe starting points, not hidden magic
+
+## Suggested Reading Order
+
+Read the code in this order:
+
+1. `src/model/lm.rs`
+2. `src/train/training.rs`
+3. `src/data/training_data.rs`
+4. `src/infer/sample.rs`
+5. `src/runtime/checkpoint.rs`
+6. `src/app/cli/`
+
+Why this order:
+
+- `model` contains the mathematical core
+- `train` shows how the core is optimized
+- `data` explains what the model is actually trained on
+- `infer` shows how generation reuses the same core
+- `runtime` explains persistence and resume
+- `app` is only the outer wiring
+
+## Recommended Classroom Targets
+
+All targets assume Apple Silicon with `16 GB` unified memory.
+
+- `debug-tiny`: smoke test, 4 layers, `d_model=256`, `seq_len=128`, CPU by default
+- `class-small`: default classroom pretraining baseline, 8 layers, `d_model=512`, `seq_len=256`, micro-batch `4`, grad accumulation `2`
+- `class-serious`: longer instructor-sized run, 12 layers, `d_model=768`, `seq_len=512`, micro-batch `2`, grad accumulation `4`, activation checkpointing enabled
+- `class-chat`: short chat SFT continuation over a pretrained checkpoint, 12 layers, `d_model=768`, `seq_len=512`, micro-batch `2`, grad accumulation `4`, activation checkpointing enabled
+
+The recommended student progression is:
+
+1. `debug-tiny`
+2. `class-small`
+3. `class-chat`
+4. inspect `class-serious` as the scaled-up version of the same codepath
+
+## What Is Deferred
+
+These are explicitly deferred until they are fully implemented and tested:
+
+- 1024-context training as the default classroom path
+- quantized inference
 - LoRA
-- adapters
-- prompt tuning
-- instruction fine-tuning
-- preference optimization
 
-Architectural impact:
-
-- checkpointing should distinguish base weights from adaptation layers
-- training code should allow freezing subsets of parameters
-
-## Inference/runtime upgrades
-
-Future:
-
-- top-k and nucleus sampling
-- repetition penalties
-- streaming token generation
-- conversation templates
-- tool calling interfaces
-
-Architectural impact:
-
-- decoding logic should be separated from raw forward pass
-
-## Terminal Chat Interface Architecture
-
-The terminal chat interface should be a thin layer on top of the runtime, not a separate model implementation.
-
-### Components
-
-- checkpoint loader
-- tokenizer
-- prompt formatter
-- context manager
-- sampler
-- terminal renderer
-
-### Prompt formatting layer
-
-The chat layer should own prompt formatting, for example:
-
-```text
-<system>
-You are a helpful assistant.
-</system>
-<user>
-Hello
-</user>
-<assistant>
-```
-
-This formatting must be explicit and versioned if saved in checkpoints or evaluation fixtures.
-
-### Context manager
-
-Responsibilities:
-
-- append new turns
-- truncate old turns to fit `block_size`
-- preserve special tokens and separators
-
-### Decoding layer
-
-Responsibilities:
-
-- temperature
-- top-k
-- max new tokens
-- stop sequences
-
-## Architecture for a Self-Improving Research System
-
-This section addresses the long-term goal of building a system that can improve itself through sustained AI research. The architecture must distinguish between:
-
-- the model being improved
-- the research agent proposing improvements
-- the trusted evaluation and promotion system
-
-Those must not collapse into one opaque loop.
-
-## Control-plane architecture
-
-```text
-                +----------------------------+
-                |     Research Orchestrator  |
-                | hypotheses | planning      |
-                +-------------+--------------+
-                              |
-                              v
-                +----------------------------+
-                |    Experiment Generator    |
-                | config edits | code patches|
-                +-------------+--------------+
-                              |
-                              v
-                +----------------------------+
-                |   Isolated Experiment Run  |
-                | sandbox | train | eval     |
-                +-------------+--------------+
-                              |
-                              v
-                +----------------------------+
-                |     Evaluation Harness     |
-                | metrics | regressions      |
-                +-------------+--------------+
-                              |
-                 +------------+-------------+
-                 |                          |
-                 v                          v
-      +----------------------+   +----------------------+
-      | Promotion Gate       |   | Experiment Archive   |
-      | policy | approval    |   | data | traces | code |
-      +-----------+----------+   +----------------------+
-                  |
-                  v
-      +----------------------+
-      | Trusted Main Branch  |
-      | model | configs      |
-      +----------------------+
-```
-
-## Research loop components
-
-### 1. Hypothesis generator
-
-Purpose:
-
-- propose candidate improvements such as:
-  - optimizer changes
-  - architecture changes
-  - tokenizer changes
-  - curriculum changes
-  - prompt formatting changes
-  - evaluation additions
-
-Inputs:
-
-- prior experiment results
-- failure cases
-- benchmark regressions
-- codebase state
-
-Outputs:
-
-- structured experiment proposals
-
-### 2. Experiment generator
-
-Purpose:
-
-- turn a proposal into:
-  - config diffs
-  - code changes
-  - dataset variants
-  - evaluation plans
-
-Key rule:
-
-Generated changes must be explicit artifacts, not hidden state.
-
-### 3. Sandboxed experiment runner
-
-Purpose:
-
-- execute candidate changes in isolation
-- run training and evaluation
-- collect logs, metrics, checkpoints, and diffs
-
-Key rule:
-
-Experiments never run directly against the trusted production branch or production checkpoints without isolation.
-
-### 4. Evaluation harness
-
-Purpose:
-
-- determine whether an experiment is actually better
-
-Evaluation dimensions should include:
-
-- training loss
-- validation loss
-- sample quality
-- benchmark tasks
-- performance cost
-- memory cost
-- stability
-- reproducibility
-- safety regressions
-
-### 5. Promotion gate
-
-Purpose:
-
-- decide whether an experiment can modify the trusted codebase or become the new default model
-
-Promotion should require:
-
-- passing tests
-- passing benchmark thresholds
-- no safety regressions
-- human approval for high-impact changes
-
-## Requirements for safe self-improvement
-
-### Reproducibility
-
-Every experiment must record:
-
-- code revision
-- config
-- seed
-- dataset version
-- checkpoint lineage
-- evaluation results
-
-### Isolation
-
-Research agents should operate on branches, worktrees, or sandboxed copies, not on the trusted runtime directly.
-
-### Auditability
-
-The system must persist:
-
-- proposed change
-- rationale
-- generated diff
-- experiment logs
-- metrics
-- promotion decision
-
-### Rollback
-
-Every promoted change must be reversible. Checkpoints and code versions should be addressable by stable IDs.
-
-### Human oversight
-
-For the foreseeable future, architecture changes, evaluation changes, and self-modifying code changes should remain human-approved.
-
-## What "self-improving" should mean in practice
-
-Good interpretation:
-
-- the system proposes experiments
-- runs them in sandboxes
-- measures them against stable evals
-- presents promotion candidates
-- learns from prior results
-
-Bad interpretation:
-
-- the model rewrites its own core loop in place
-- changes evaluation criteria to flatter itself
-- promotes its own checkpoints without audit
-- gains unrestricted access to code, data, and deployment
-
-The architecture should support the first and structurally prevent the second.
-
-## Evaluation Architecture for Research Automation
-
-The research system needs its own durable evaluation layer.
-
-### Evaluation tiers
-
-Tier 1:
-
-- unit tests
-- checkpoint format tests
-- deterministic smoke tests
-
-Tier 2:
-
-- training quality tests
-- held-out validation loss
-- decoding sanity tests
-
-Tier 3:
-
-- task benchmarks
-- conversation quality rubrics
-- code generation tasks
-- reasoning tasks
-
-Tier 4:
-
-- safety and policy checks
-- resource budget checks
-- reproducibility checks
-
-Promotion should require passing all relevant tiers.
-
-## Data Architecture for Research
-
-The model and research system should use versioned datasets.
-
-Recommended layers:
-
-- raw corpora
-- cleaned corpora
-- tokenized corpora
-- train/validation/test splits
-- benchmark fixtures
-- conversation templates
-- experiment outputs
-
-Each dataset artifact should have:
-
-- version ID
-- schema description
-- provenance
-- licensing metadata
-
-## Observability and Telemetry
-
-Over time, the architecture should expose structured metrics such as:
-
-- step loss
-- validation loss
-- gradient norm
-- parameter norm
-- tokens per second
-- time per step
-- memory footprint
-- sample outputs
-- evaluation pass/fail status
-
-These metrics should feed both human dashboards and future research automation.
-
-## Security Boundaries
-
-If the system grows into automated research, security boundaries become part of the architecture.
-
-Recommended boundaries:
-
-- read-only access to trusted baselines
-- write access only inside sandboxed experiment directories
-- explicit approval for promotion
-- restricted network access by default
-- separate credentials for data access, compute access, and deployment access
-
-## Recommended Evolution Path
-
-## Stage 1: Compact educational engine
-
-- single crate
-- std-only
-- byte tokenizer
-- one-machine training
-- checkpointing and sampling
-
-## Stage 2: Practical local LLM lab
-
-- configurable tokenizer
-- better decoding
-- eval harness
-- terminal chat
-- generalized data formats
-
-## Stage 3: Research platform
-
-- experiment tracking
-- benchmark suite
-- controlled adaptation methods
-- automated proposal generation
-- sandboxed experiment execution
-
-## Stage 4: Safe self-improving system
-
-- structured hypothesis generation
-- experiment search over model, data, and optimizer choices
-- trusted promotion gates
-- persistent experiment memory
-- human-supervised promotion and rollback
-
-## Architectural Decision Summary
-
-The most important decisions are:
-
-1. Keep the model runtime as a small, trusted kernel.
-2. Keep tokenizer, checkpoint, CLI, and research layers outside the kernel.
-3. Add modern LLM features by extending interfaces, not by forking the runtime.
-4. Treat self-improvement as a gated control-plane problem, not as unrestricted recursive self-modification.
-
-If these constraints hold, the codebase can stay compact in the near term and still grow into a serious research platform later.
+Those are useful extensions, but they are not part of the core teaching architecture.

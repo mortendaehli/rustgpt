@@ -7,23 +7,42 @@ use crate::app::cli::{InspectVocabCommand, TrainCommand};
 use crate::core::error::Result;
 use crate::data::corpus::Dataset;
 use crate::data::tokenizer::Tokenizer;
-use crate::engine::checkpoint::{load_training_checkpoint, save_training_checkpoint};
-use crate::engine::device::{
-    CpuAutodiffBackend, CpuBackend, GpuAutodiffBackend, GpuBackend, ResolvedDeviceKind, cpu_device,
-    gpu_device,
+use crate::model::lm::{LanguageModel, LanguageModelOptimizer};
+use crate::runtime::checkpoint::{
+    CheckpointRunManifest, SaveTrainingCheckpointRequest, load_training_checkpoint,
+    save_training_checkpoint,
 };
-use crate::engine::model::{LanguageModel, LanguageModelOptimizer};
-use crate::engine::profile::RuntimeProfile;
-use crate::engine::train::{TrainingArtifacts, prepare_training_run, run_training_steps};
+use crate::runtime::device::{
+    CpuAutodiffBackend, CpuBackend, CpuCheckpointAutodiffBackend, GpuAutodiffBackend, GpuBackend,
+    GpuCheckpointAutodiffBackend, ResolvedDeviceKind, cpu_device, gpu_device,
+};
+use crate::runtime::profile::RuntimeProfile;
+use crate::train::training::{
+    TrainingArtifacts, TrainingRunRequest, prepare_training_run, run_training_steps,
+};
 
 pub fn run_train(command: TrainCommand) -> Result<()> {
     let resolved = ResolvedDeviceKind::resolve(command.train.device)?;
-    match resolved {
-        ResolvedDeviceKind::Cpu => {
+    match (resolved, command.train.activation_checkpointing) {
+        (ResolvedDeviceKind::Cpu, false) => {
             run_train_impl::<CpuBackend, CpuAutodiffBackend>(command, cpu_device(), resolved)
         }
-        ResolvedDeviceKind::Gpu => {
+        (ResolvedDeviceKind::Cpu, true) => {
+            run_train_impl::<CpuBackend, CpuCheckpointAutodiffBackend>(
+                command,
+                cpu_device(),
+                resolved,
+            )
+        }
+        (ResolvedDeviceKind::Gpu, false) => {
             run_train_impl::<GpuBackend, GpuAutodiffBackend>(command, gpu_device(), resolved)
+        }
+        (ResolvedDeviceKind::Gpu, true) => {
+            run_train_impl::<GpuBackend, GpuCheckpointAutodiffBackend>(
+                command,
+                gpu_device(),
+                resolved,
+            )
         }
     }
 }
@@ -85,6 +104,14 @@ where
         prepared.chat_template,
         prepared.starting_step
     );
+    if let Some(run_manifest) = prepared.resume_manifest.as_ref() {
+        println!(
+            "resume_manifest_data={}  resume_manifest_format={}  resume_manifest_device={}",
+            run_manifest.training_data_path.display(),
+            run_manifest.training_data_format,
+            run_manifest.resolved_device
+        );
+    }
     let train_windows = prepared
         .training_data
         .window_summary(prepared.model_config.block_size);
@@ -96,9 +123,12 @@ where
         train_windows.max_windows_per_sequence
     );
     println!(
-        "steps={}  batch_size={}  lr={}  beta1={}  beta2={}  eps={}  weight_decay={}  warmup={}  schedule={}  grad_clip={}  seed={}  mode={}  boundary={}  backend={}",
+        "steps={}  batch_size={}  grad_accum={}  effective_batch={}  act_ckpt={}  lr={}  beta1={}  beta2={}  eps={}  weight_decay={}  warmup={}  schedule={}  grad_clip={}  seed={}  mode={}  boundary={}  backend={}",
         command.train.steps,
         command.train.batch_size,
+        command.train.gradient_accumulation_steps,
+        command.train.batch_size * command.train.gradient_accumulation_steps,
+        command.train.activation_checkpointing,
         command.train.learning_rate,
         command.train.beta1,
         command.train.beta2,
@@ -138,35 +168,46 @@ where
                          optimizer: &LanguageModelOptimizer<AD>|
      -> Result<()> {
         if let Some(path) = best_checkpoint_path.as_ref() {
-            save_training_checkpoint(
+            save_training_checkpoint(SaveTrainingCheckpointRequest {
                 path,
                 model,
-                Some(optimizer),
-                &tokenizer_for_best,
+                optimizer: Some(optimizer),
+                tokenizer: &tokenizer_for_best,
                 chat_template,
                 trained_steps,
-                checkpoint_seed,
-            )?;
+                seed: checkpoint_seed,
+                run_manifest: Some(build_checkpoint_run_manifest(
+                    &command,
+                    resolved,
+                    None,
+                    Some(_validation_loss),
+                    Some(_validation_loss),
+                    None,
+                    None,
+                )),
+            })?;
         }
         Ok(())
     };
     let (artifacts, summary) = run_training_steps::<B, AD>(
         artifacts,
-        &prepared.tokenizer,
-        &prepared.training_data,
-        &command.train,
-        prepared.starting_step,
-        &device,
-        runtime_profile.as_ref(),
-        true,
-        prepared.validation_data.as_ref(),
-        Some(&mut save_best),
+        TrainingRunRequest {
+            tokenizer: &prepared.tokenizer,
+            training_data: &prepared.training_data,
+            train_config: &command.train,
+            starting_step: prepared.starting_step,
+            device: &device,
+            profile: runtime_profile.as_ref(),
+            capture_logs: true,
+            validation_data: prepared.validation_data.as_ref(),
+            on_validation: Some(&mut save_best),
+        },
     )?;
 
     for entry in &summary.log_entries {
         if let Some(validation_loss) = entry.validation_loss {
             println!(
-                "step {:>5} / {:>5}  total_step={:>5}  loss={:.4}  val={:.4}  best_val={:.4}  lr={:.5}  batch={}  t={:.2?}  doc={:?}",
+                "step {:>5} / {:>5}  total_step={:>5}  loss={:.4}  val={:.4}  best_val={:.4}  lr={:.5}  batch={}  toks={}  tok/s={:.0}  dt={:.2?}  t={:.2?}  doc={:?}",
                 entry.run_step,
                 command.train.steps,
                 entry.total_step,
@@ -175,60 +216,75 @@ where
                 entry.best_validation_loss.unwrap_or(validation_loss),
                 entry.learning_rate,
                 entry.batch_size,
+                entry.processed_tokens,
+                entry.tokens_per_second,
+                entry.step_elapsed,
                 entry.elapsed,
                 entry.first_doc,
             );
         } else {
             println!(
-                "step {:>5} / {:>5}  total_step={:>5}  loss={:.4}  lr={:.5}  batch={}  t={:.2?}  doc={:?}",
+                "step {:>5} / {:>5}  total_step={:>5}  loss={:.4}  lr={:.5}  batch={}  toks={}  tok/s={:.0}  dt={:.2?}  t={:.2?}  doc={:?}",
                 entry.run_step,
                 command.train.steps,
                 entry.total_step,
                 entry.loss,
                 entry.learning_rate,
                 entry.batch_size,
+                entry.processed_tokens,
+                entry.tokens_per_second,
+                entry.step_elapsed,
                 entry.elapsed,
                 entry.first_doc,
             );
         }
     }
 
-    let elapsed = summary
-        .log_entries
-        .last()
-        .map(|entry| entry.elapsed)
-        .unwrap_or_default();
     if let Some(validation_loss) = summary.final_validation_loss {
         println!(
-            "done  final_loss={:.4}  final_val={:.4}  best_val={:.4}  elapsed={:.2?}",
+            "done  final_loss={:.4}  final_val={:.4}  best_val={:.4}  tokens={}  avg_tok/s={:.0}  elapsed={:.2?}",
             summary.final_loss,
             validation_loss,
             summary.best_validation_loss.unwrap_or(validation_loss),
-            elapsed
+            summary.total_tokens,
+            summary.average_tokens_per_second,
+            summary.elapsed
         );
     } else {
         println!(
-            "done  final_loss={:.4}  elapsed={:.2?}",
-            summary.final_loss, elapsed
+            "done  final_loss={:.4}  tokens={}  avg_tok/s={:.0}  elapsed={:.2?}",
+            summary.final_loss,
+            summary.total_tokens,
+            summary.average_tokens_per_second,
+            summary.elapsed
         );
     }
-    if let Some(runtime_profile) = runtime_profile.as_ref() {
-        if !runtime_profile.is_empty() {
-            println!("stage timings:");
-            println!("{}", runtime_profile.format_table());
-        }
+    if let Some(runtime_profile) = runtime_profile.as_ref()
+        && !runtime_profile.is_empty()
+    {
+        println!("stage timings:");
+        println!("{}", runtime_profile.format_table());
     }
 
     if let Some(checkpoint_out) = &command.checkpoint_out {
-        save_training_checkpoint(
-            checkpoint_out,
-            &artifacts.model,
-            Some(&artifacts.optimizer),
-            &prepared.tokenizer,
-            prepared.chat_template,
-            prepared.starting_step + command.train.steps,
-            prepared.checkpoint_seed,
-        )?;
+        save_training_checkpoint(SaveTrainingCheckpointRequest {
+            path: checkpoint_out,
+            model: &artifacts.model,
+            optimizer: Some(&artifacts.optimizer),
+            tokenizer: &prepared.tokenizer,
+            chat_template: prepared.chat_template,
+            trained_steps: prepared.starting_step + command.train.steps,
+            seed: prepared.checkpoint_seed,
+            run_manifest: Some(build_checkpoint_run_manifest(
+                &command,
+                resolved,
+                Some(summary.final_loss),
+                summary.final_validation_loss,
+                summary.best_validation_loss,
+                Some(summary.total_tokens),
+                Some(summary.average_tokens_per_second),
+            )),
+        })?;
         println!("saved checkpoint={}", checkpoint_out.display());
     }
 
@@ -246,6 +302,38 @@ fn derive_best_checkpoint_path(path: &Path) -> PathBuf {
         .and_then(|ext| ext.to_str())
         .unwrap_or("ckpt");
     parent.join(format!("{stem}.best.{extension}"))
+}
+
+fn build_checkpoint_run_manifest(
+    command: &TrainCommand,
+    resolved: ResolvedDeviceKind,
+    final_loss: Option<f32>,
+    validation_loss: Option<f32>,
+    best_validation_loss: Option<f32>,
+    total_tokens: Option<usize>,
+    average_tokens_per_second: Option<f32>,
+) -> CheckpointRunManifest {
+    let saved_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    CheckpointRunManifest {
+        saved_at_ms,
+        train_config: command.train.clone(),
+        training_data_path: command.data.data_path.clone(),
+        training_data_format: command.data.format,
+        validation_data_path: command
+            .validation_data
+            .as_ref()
+            .map(|config| config.data_path.clone()),
+        validation_data_format: command.validation_data.as_ref().map(|config| config.format),
+        resolved_device: resolved.description().to_string(),
+        final_loss,
+        validation_loss,
+        best_validation_loss,
+        total_tokens,
+        average_tokens_per_second,
+    }
 }
 
 pub fn run_inspect_vocab(command: InspectVocabCommand) -> Result<()> {
