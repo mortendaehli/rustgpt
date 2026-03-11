@@ -1,13 +1,14 @@
-//! RustGPT is organized into a few teaching-oriented layers:
+#![recursion_limit = "256"]
+
+//! RustGPT is organized into a few maintainable research-oriented layers:
 //! `app` for CLI entrypoints, `core` for reusable primitives,
-//! `data` for corpora/tokenizers/checkpoints, `model` for transformer
-//! parameters, and `runtime` for forward/backward/training/sampling.
+//! `data` for corpora/tokenizers/checkpoints, and `engine`
+//! for the Burn-backed language model runtime.
 
 pub mod app;
 pub mod core;
 pub mod data;
-pub mod model;
-pub mod runtime;
+pub mod engine;
 
 use crate::core::error::Result;
 
@@ -38,6 +39,6 @@ where
         app::cli::Command::BenchSample(command) => app::commands::bench::run_bench_sample(command),
         app::cli::Command::Chat(command) => app::commands::chat::run_chat(command),
         app::cli::Command::Eval(command) => app::commands::eval::run_eval(command),
-        app::cli::Command::GpuInfo(command) => runtime::backend::run_gpu_info(command),
+        app::cli::Command::GpuInfo(command) => app::commands::gpu_info::run_gpu_info(command),
     }
 }

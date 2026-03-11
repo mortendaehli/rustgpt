@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 arrow-array = "54"
 arrow-schema = "54"
+burn = { version = "0.19", features = ["train", "wgpu", "ndarray"] }
 parquet = { version = "54", features = ["json"] }
 pollster = "0.3"
 serde = { version = "1", features = ["derive"] }

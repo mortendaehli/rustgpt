@@ -1,7 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DataFormat {
     Lines,
     PlainText,
@@ -42,7 +43,7 @@ impl Display for DataFormat {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ChatTemplateKind {
     SimpleTranscript,
     ChatMl,
@@ -67,7 +68,7 @@ impl Display for ChatTemplateKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TrainMode {
     Auto,
     Pretrain,
@@ -95,7 +96,7 @@ impl Display for TrainMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum BoundaryMode {
     SharedBos,
     SeparateBosEos,
@@ -110,7 +111,7 @@ impl Display for BoundaryMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DeviceKind {
     Cpu,
     Auto,
@@ -138,7 +139,7 @@ impl Display for DeviceKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ActivationKind {
     Relu,
     Gelu,
@@ -166,7 +167,7 @@ impl Display for ActivationKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PositionEncodingKind {
     LearnedAbsolute,
     Rope,
@@ -191,7 +192,7 @@ impl Display for PositionEncodingKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum LrScheduleKind {
     Linear,
     Cosine,
@@ -216,7 +217,7 @@ impl Display for LrScheduleKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TokenizerModelKind {
     Bpe,
 }
@@ -238,7 +239,7 @@ impl Display for TokenizerModelKind {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DataConfig {
     pub data_path: PathBuf,
     pub format: DataFormat,
@@ -265,7 +266,7 @@ impl Default for DataConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct TrainConfig {
     pub steps: usize,
     pub batch_size: usize,
@@ -328,7 +329,7 @@ impl Default for TrainConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct SampleConfig {
     pub prompt: String,
     pub max_new_tokens: usize,
@@ -350,7 +351,7 @@ impl Default for SampleConfig {
             prompt: String::new(),
             max_new_tokens: 16,
             temperature: 0.5,
-            top_k: 0,
+            top_k: 40,
             top_p: 1.0,
             repetition_penalty: 1.0,
             presence_penalty: 0.0,
@@ -363,7 +364,7 @@ impl Default for SampleConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ChatConfig {
     pub system_prompt: String,
     pub max_new_tokens: usize,
@@ -384,7 +385,7 @@ impl Default for ChatConfig {
             system_prompt: String::new(),
             max_new_tokens: 32,
             temperature: 0.5,
-            top_k: 0,
+            top_k: 40,
             top_p: 1.0,
             repetition_penalty: 1.0,
             presence_penalty: 0.0,
@@ -396,7 +397,7 @@ impl Default for ChatConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct GpuInfoConfig {
     pub device: DeviceKind,
 }
@@ -409,7 +410,7 @@ impl Default for GpuInfoConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PrepareDataConfig {
     pub output_path: PathBuf,
     pub output_format: DataFormat,
@@ -426,7 +427,7 @@ impl Default for PrepareDataConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TrainTokenizerConfig {
     pub output_path: PathBuf,
     pub model: TokenizerModelKind,
@@ -447,7 +448,7 @@ impl Default for TrainTokenizerConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BenchmarkConfig {
     pub iterations: usize,
     pub warmup: usize,
@@ -462,7 +463,7 @@ impl Default for BenchmarkConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct EvalConfig {
     pub max_examples: usize,
     pub prompts: Vec<String>,
@@ -495,7 +496,7 @@ impl Default for EvalConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InspectVocabConfig {
     pub boundary_mode: BoundaryMode,
     pub show_tokens: usize,
@@ -510,7 +511,7 @@ impl Default for InspectVocabConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ModelConfig {
     pub vocab_size: usize,
     pub block_size: usize,

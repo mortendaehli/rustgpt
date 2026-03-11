@@ -1,6 +1,6 @@
 use crate::core::config::{
     ActivationKind, BoundaryMode, ChatTemplateKind, DataFormat, DeviceKind, LrScheduleKind,
-    PositionEncodingKind, TokenizerModelKind, TrainMode,
+    TokenizerModelKind, TrainMode,
 };
 
 use super::{Command, parse_args};
@@ -129,8 +129,8 @@ fn train_parser_reads_swiglu_activation_override() {
 }
 
 #[test]
-fn train_parser_reads_position_override() {
-    let command = parse_args([
+fn train_parser_rejects_unsupported_position_override() {
+    let err = parse_args([
         "rustgpt".to_string(),
         "train".to_string(),
         "--data".to_string(),
@@ -138,17 +138,17 @@ fn train_parser_reads_position_override() {
         "--position".to_string(),
         "rope".to_string(),
     ])
-    .unwrap();
+    .unwrap_err();
 
-    let Command::Train(parsed) = command else {
-        panic!("expected train command");
-    };
-    assert_eq!(parsed.train.position_encoding, PositionEncodingKind::Rope);
+    assert_eq!(
+        err.to_string(),
+        "the Burn runtime currently supports only --position learned"
+    );
 }
 
 #[test]
-fn train_parser_reads_kv_head_override() {
-    let command = parse_args([
+fn train_parser_rejects_mismatched_kv_head_override() {
+    let err = parse_args([
         "rustgpt".to_string(),
         "train".to_string(),
         "--data".to_string(),
@@ -158,13 +158,30 @@ fn train_parser_reads_kv_head_override() {
         "--n-kv-head".to_string(),
         "2".to_string(),
     ])
-    .unwrap();
+    .unwrap_err();
 
-    let Command::Train(parsed) = command else {
-        panic!("expected train command");
-    };
-    assert_eq!(parsed.train.n_head, 8);
-    assert_eq!(parsed.train.n_kv_head, 2);
+    assert_eq!(
+        err.to_string(),
+        "the Burn runtime currently supports only --n-kv-head matching --n-head (got 2 vs 8)"
+    );
+}
+
+#[test]
+fn train_parser_rejects_zero_sample_every() {
+    let err = parse_args([
+        "rustgpt".to_string(),
+        "train".to_string(),
+        "--data".to_string(),
+        "names.txt".to_string(),
+        "--sample-every".to_string(),
+        "0".to_string(),
+    ])
+    .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "invalid value for --sample-every: expected an integer >= 1"
+    );
 }
 
 #[test]

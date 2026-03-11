@@ -1,14 +1,27 @@
+use burn::tensor::backend::Backend;
+
 use crate::app::cli::SampleCommand;
 use crate::core::error::Result;
 use crate::core::rng::Rng;
-use crate::data::checkpoint::load_checkpoint;
-use crate::runtime::backend::ComputeBackend;
-use crate::runtime::profile::RuntimeProfile;
-use crate::runtime::sampling::{SamplingStrategy, generate_sample_with_backend};
+use crate::engine::checkpoint::load_inference_checkpoint;
+use crate::engine::device::{CpuBackend, GpuBackend, ResolvedDeviceKind, cpu_device, gpu_device};
+use crate::engine::generate::{SamplingStrategy, generate_sample};
+use crate::engine::profile::RuntimeProfile;
 
 pub fn run_sample(command: SampleCommand) -> Result<()> {
-    let checkpoint = load_checkpoint(&command.checkpoint)?;
-    let backend = ComputeBackend::from_model(&checkpoint.model, command.sample.device)?;
+    let resolved = ResolvedDeviceKind::resolve(command.sample.device)?;
+    match resolved {
+        ResolvedDeviceKind::Cpu => run_sample_impl::<CpuBackend>(command, cpu_device(), resolved),
+        ResolvedDeviceKind::Gpu => run_sample_impl::<GpuBackend>(command, gpu_device(), resolved),
+    }
+}
+
+fn run_sample_impl<B: Backend>(
+    command: SampleCommand,
+    device: B::Device,
+    resolved: ResolvedDeviceKind,
+) -> Result<()> {
+    let checkpoint = load_inference_checkpoint::<B>(&command.checkpoint, &device)?;
     let mut rng = Rng::from_seed(command.sample.seed);
     let runtime_profile = command.sample.profile.then(RuntimeProfile::default);
 
@@ -21,7 +34,7 @@ pub fn run_sample(command: SampleCommand) -> Result<()> {
         command.sample.temperature,
         command.sample.top_k,
         command.sample.top_p,
-        backend.description()
+        resolved.description()
     );
     println!(
         "trained_steps={}  max_new_tokens={}  samples={}",
@@ -38,9 +51,8 @@ pub fn run_sample(command: SampleCommand) -> Result<()> {
     };
 
     for sample_idx in 0..command.sample.samples {
-        let sample = generate_sample_with_backend(
+        let sample = generate_sample(
             &checkpoint.model,
-            &backend,
             &checkpoint.tokenizer,
             &command.sample.prompt,
             command.sample.max_new_tokens,

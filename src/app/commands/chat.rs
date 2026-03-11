@@ -1,19 +1,31 @@
 use std::io::{self, Write};
 
+use burn::tensor::backend::Backend;
+
 use crate::app::cli::ChatCommand;
 use crate::core::error::Result;
 use crate::core::rng::Rng;
-use crate::data::checkpoint::load_checkpoint;
-use crate::runtime::backend::ComputeBackend;
-use crate::runtime::chat::{ChatDirective, ChatSession, parse_chat_directive};
-use crate::runtime::sampling::{
-    SamplingStrategy, generate_completion_from_tokens_streaming_with_backend,
-    generate_completion_from_tokens_with_backend,
+use crate::engine::chat::{ChatDirective, ChatSession, parse_chat_directive};
+use crate::engine::checkpoint::load_inference_checkpoint;
+use crate::engine::device::{CpuBackend, GpuBackend, ResolvedDeviceKind, cpu_device, gpu_device};
+use crate::engine::generate::{
+    SamplingStrategy, generate_completion_from_tokens, generate_completion_streaming,
 };
 
 pub fn run_chat(command: ChatCommand) -> Result<()> {
-    let checkpoint = load_checkpoint(&command.checkpoint)?;
-    let backend = ComputeBackend::from_model(&checkpoint.model, command.chat.device)?;
+    let resolved = ResolvedDeviceKind::resolve(command.chat.device)?;
+    match resolved {
+        ResolvedDeviceKind::Cpu => run_chat_impl::<CpuBackend>(command, cpu_device(), resolved),
+        ResolvedDeviceKind::Gpu => run_chat_impl::<GpuBackend>(command, gpu_device(), resolved),
+    }
+}
+
+fn run_chat_impl<B: Backend>(
+    command: ChatCommand,
+    device: B::Device,
+    resolved: ResolvedDeviceKind,
+) -> Result<()> {
+    let checkpoint = load_inference_checkpoint::<B>(&command.checkpoint, &device)?;
     let mut rng = Rng::from_seed(command.chat.seed);
     let mut session =
         ChatSession::new(checkpoint.chat_template, command.chat.system_prompt.clone());
@@ -30,9 +42,9 @@ pub fn run_chat(command: ChatCommand) -> Result<()> {
         "RustGPT chat  checkpoint={}  trained_steps={}  context={}  max_new_tokens={}  backend={}",
         command.checkpoint.display(),
         checkpoint.trained_steps,
-        checkpoint.model.cfg.block_size,
+        checkpoint.model.config().block_size,
         command.chat.max_new_tokens,
-        backend.description()
+        resolved.description()
     );
     println!("Commands: /exit  /reset  /history");
     println!("Submit a message with an empty line. Multi-line UTF-8 input is supported.");
@@ -61,7 +73,7 @@ pub fn run_chat(command: ChatCommand) -> Result<()> {
         session.push_user_turn(&input);
         let prepared_prompt = session.prepare_prompt(
             &checkpoint.tokenizer,
-            checkpoint.model.cfg.block_size,
+            checkpoint.model.config().block_size,
             command.chat.max_new_tokens,
         )?;
         if prepared_prompt.dropped_turns > 0 {
@@ -77,9 +89,8 @@ pub fn run_chat(command: ChatCommand) -> Result<()> {
                 print!("{delta}");
                 let _ = io::stdout().flush();
             };
-            let reply = generate_completion_from_tokens_streaming_with_backend(
+            let reply = generate_completion_streaming(
                 &checkpoint.model,
-                &backend,
                 &checkpoint.tokenizer,
                 &prepared_prompt.prompt_tokens,
                 command.chat.max_new_tokens,
@@ -92,9 +103,8 @@ pub fn run_chat(command: ChatCommand) -> Result<()> {
             println!();
             reply
         } else {
-            let reply = generate_completion_from_tokens_with_backend(
+            let reply = generate_completion_from_tokens(
                 &checkpoint.model,
-                &backend,
                 &checkpoint.tokenizer,
                 &prepared_prompt.prompt_tokens,
                 command.chat.max_new_tokens,
@@ -154,7 +164,7 @@ fn read_user_message(stdin: &io::Stdin) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::chat::{ChatDirective, parse_chat_directive};
+    use crate::engine::chat::{ChatDirective, parse_chat_directive};
 
     #[test]
     fn directives_are_detected_before_multiline_collection() {

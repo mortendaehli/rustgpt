@@ -9,6 +9,8 @@ mod training;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use crate::core::config::BoundaryMode;
 use crate::core::error::{Result, RustGptError};
 
@@ -16,7 +18,7 @@ pub(crate) use self::byte::ByteTokenizer;
 pub(crate) use self::hf::HfTokenizer;
 pub use self::training::{TokenizerTrainingSummary, train_tokenizer_from_dataset};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TokenSymbol {
     Byte(u8),
     Piece(String),

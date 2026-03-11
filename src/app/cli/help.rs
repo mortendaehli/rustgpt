@@ -72,10 +72,10 @@ Options:
   --n-layer <N>         Number of transformer layers. Default: 1
   --n-embd <N>          Embedding width. Default: 16
   --n-head <N>          Attention heads. Default: 4
-  --n-kv-head <N>       Key/value heads for GQA. Default: same as --n-head
+  --n-kv-head <N>       Key/value heads. Burn runtime currently requires matching --n-head
   --tied-embeddings     Reuse token embeddings as the output projection
   --activation <K>      MLP activation: relu | gelu | swiglu. Default: relu
-  --position <K>        Position encoding: learned | rope. Default: learned
+  --position <K>        Position encoding: learned. Default: learned
   --lr <F32>            Learning rate. Default: 0.01
   --beta1 <F32>         Adam beta1. Default: 0.85
   --beta2 <F32>         Adam beta2. Default: 0.99
@@ -119,7 +119,7 @@ Options:
   --checkpoint <PATH>   Path to a saved checkpoint
   --prompt <TEXT>       Prompt prefix to condition on
   --temperature <F32>   Sampling temperature. Default: 0.5
-  --top-k <N>           Keep only the top-k tokens. Default: 0 (disabled)
+  --top-k <N>           Keep only the top-k tokens. Default: 40
   --top-p <F32>         Nucleus sampling threshold. Default: 1.0
   --repetition-penalty <F32>
                        Penalize already-seen tokens. Default: 1.0
@@ -205,7 +205,7 @@ Options:
   --checkpoint <PATH>   Path to a saved checkpoint
   --system <TEXT>       Optional system prompt prepended to the chat transcript
   --temperature <F32>   Sampling temperature. Default: 0.5
-  --top-k <N>           Keep only the top-k tokens. Default: 0 (disabled)
+  --top-k <N>           Keep only the top-k tokens. Default: 40
   --top-p <F32>         Nucleus sampling threshold. Default: 1.0
   --repetition-penalty <F32>
                        Penalize already-seen tokens. Default: 1.0

@@ -1,16 +1,21 @@
 use std::time::{Duration, Instant};
 
+use burn::tensor::backend::{AutodiffBackend, Backend};
+
 use crate::app::cli::{
     BenchCompareTrainCommand, BenchSampleCommand, BenchTrainCommand, TrainCommand,
 };
 use crate::core::config::{BenchmarkConfig, DeviceKind};
 use crate::core::error::Result;
 use crate::core::rng::Rng;
-use crate::data::checkpoint::load_checkpoint;
-use crate::runtime::backend::ComputeBackend;
-use crate::runtime::profile::RuntimeProfile;
-use crate::runtime::sampling::{SamplingStrategy, generate_sample_with_backend};
-use crate::runtime::training::{prepare_training_run, run_training_steps};
+use crate::engine::checkpoint::{load_inference_checkpoint, load_training_checkpoint};
+use crate::engine::device::{
+    CpuAutodiffBackend, CpuBackend, GpuAutodiffBackend, GpuBackend, ResolvedDeviceKind, cpu_device,
+    gpu_device,
+};
+use crate::engine::generate::{SamplingStrategy, generate_sample};
+use crate::engine::profile::RuntimeProfile;
+use crate::engine::train::{TrainingArtifacts, prepare_training_run, run_training_steps};
 
 #[derive(Debug)]
 struct TrainBenchSummary {
@@ -27,16 +32,40 @@ impl TrainBenchSummary {
 }
 
 pub fn run_bench_train(command: BenchTrainCommand) -> Result<()> {
-    let summary = bench_train_iterations(&command.train, &command.bench, None)?;
+    let resolved = ResolvedDeviceKind::resolve(command.train.train.device)?;
+    let summary = match resolved {
+        ResolvedDeviceKind::Cpu => bench_train_iterations::<CpuBackend, CpuAutodiffBackend>(
+            &command.train,
+            &command.bench,
+            cpu_device(),
+        )?,
+        ResolvedDeviceKind::Gpu => bench_train_iterations::<GpuBackend, GpuAutodiffBackend>(
+            &command.train,
+            &command.bench,
+            gpu_device(),
+        )?,
+    };
     print_bench_summary("train", &summary, &command.bench);
     Ok(())
 }
 
 pub fn run_bench_compare_train(command: BenchCompareTrainCommand) -> Result<()> {
-    let cpu_summary =
-        bench_train_iterations(&command.train, &command.bench, Some(DeviceKind::Cpu))?;
-    let gpu_summary =
-        bench_train_iterations(&command.train, &command.bench, Some(DeviceKind::Gpu))?;
+    let cpu_summary = bench_train_iterations::<CpuBackend, CpuAutodiffBackend>(
+        &command.train,
+        &command.bench,
+        cpu_device(),
+    )?;
+    let gpu_summary = bench_train_iterations::<GpuBackend, GpuAutodiffBackend>(
+        &TrainCommand {
+            train: crate::core::config::TrainConfig {
+                device: DeviceKind::Gpu,
+                ..command.train.train.clone()
+            },
+            ..command.train.clone()
+        },
+        &command.bench,
+        gpu_device(),
+    )?;
 
     println!("RustGPT benchmark  mode=train-compare");
     println!(
@@ -53,8 +82,23 @@ pub fn run_bench_compare_train(command: BenchCompareTrainCommand) -> Result<()> 
 }
 
 pub fn run_bench_sample(command: BenchSampleCommand) -> Result<()> {
-    let checkpoint = load_checkpoint(&command.sample.checkpoint)?;
-    let backend = ComputeBackend::from_model(&checkpoint.model, command.sample.sample.device)?;
+    let resolved = ResolvedDeviceKind::resolve(command.sample.sample.device)?;
+    match resolved {
+        ResolvedDeviceKind::Cpu => {
+            run_bench_sample_impl::<CpuBackend>(command, cpu_device(), resolved)
+        }
+        ResolvedDeviceKind::Gpu => {
+            run_bench_sample_impl::<GpuBackend>(command, gpu_device(), resolved)
+        }
+    }
+}
+
+fn run_bench_sample_impl<B: Backend>(
+    command: BenchSampleCommand,
+    device: B::Device,
+    _resolved: ResolvedDeviceKind,
+) -> Result<()> {
+    let checkpoint = load_inference_checkpoint::<B>(&command.sample.checkpoint, &device)?;
     let mut durations = Vec::with_capacity(command.bench.iterations);
     let aggregate_profile = RuntimeProfile::default();
     let strategy = SamplingStrategy {
@@ -70,9 +114,8 @@ pub fn run_bench_sample(command: BenchSampleCommand) -> Result<()> {
         let profile = RuntimeProfile::default();
         let mut rng = Rng::from_seed(command.sample.sample.seed + bench_idx as u64);
         let started_at = Instant::now();
-        let _sample = generate_sample_with_backend(
+        let _sample = generate_sample(
             &checkpoint.model,
-            &backend,
             &checkpoint.tokenizer,
             &command.sample.sample.prompt,
             command.sample.sample.max_new_tokens,
@@ -98,35 +141,44 @@ pub fn run_bench_sample(command: BenchSampleCommand) -> Result<()> {
     Ok(())
 }
 
-fn bench_train_iterations(
+fn bench_train_iterations<B, AD>(
     command: &TrainCommand,
     bench: &BenchmarkConfig,
-    device_override: Option<DeviceKind>,
-) -> Result<TrainBenchSummary> {
+    device: AD::Device,
+) -> Result<TrainBenchSummary>
+where
+    B: Backend<Device = AD::Device>,
+    AD: AutodiffBackend<InnerBackend = B>,
+{
     let mut durations = Vec::with_capacity(bench.iterations);
     let aggregate_profile = RuntimeProfile::default();
 
     for bench_idx in 0..(bench.warmup + bench.iterations) {
         let profile = RuntimeProfile::default();
-        let mut prepared = prepare_training_run(
+        let prepared = prepare_training_run(
             &command.data,
             &command.train,
             command.validation_data.as_ref(),
             command.resume.as_deref(),
         )?;
-        let mut backend = ComputeBackend::from_model(
-            &prepared.model,
-            device_override.unwrap_or(command.train.device),
-        )?;
+        let artifacts = if let Some(resume_path) = command.resume.as_deref() {
+            let loaded = load_training_checkpoint::<AD>(resume_path, &device, &command.train)?;
+            TrainingArtifacts {
+                model: loaded.model,
+                optimizer: loaded.optimizer,
+            }
+        } else {
+            TrainingArtifacts::new(&prepared.model_config, &command.train, &device)?
+        };
 
         let started_at = Instant::now();
-        let _summary = run_training_steps(
-            &mut prepared.model,
+        let _summary = run_training_steps::<B, AD>(
+            artifacts,
             &prepared.tokenizer,
             &prepared.training_data,
-            &mut backend,
             &command.train,
             prepared.starting_step,
+            &device,
             Some(&profile),
             false,
             prepared.validation_data.as_ref(),

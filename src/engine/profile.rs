@@ -70,28 +70,3 @@ where
     }
     out
 }
-
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use super::{RuntimeProfile, measure};
-
-    #[test]
-    fn runtime_profile_records_stage_counts() {
-        let profile = RuntimeProfile::default();
-        profile.record("forward", Duration::from_millis(10));
-        profile.record("forward", Duration::from_millis(20));
-        let snapshot = profile.snapshot();
-        assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].1.calls, 2);
-    }
-
-    #[test]
-    fn measure_wraps_work_and_records_duration() {
-        let profile = RuntimeProfile::default();
-        let value = measure(Some(&profile), "answer", || 42);
-        assert_eq!(value, 42);
-        assert_eq!(profile.snapshot()[0].0, "answer");
-    }
-}

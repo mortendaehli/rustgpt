@@ -1,17 +1,30 @@
+use burn::tensor::backend::Backend;
+
 use crate::app::cli::EvalCommand;
 use crate::core::error::{Result, RustGptError};
 use crate::core::rng::Rng;
-use crate::data::checkpoint::load_checkpoint;
 use crate::data::corpus::Dataset;
 use crate::data::eval_suite::{PromptEvalCase, load_prompt_eval_suite};
 use crate::data::training_data::TrainingData;
-use crate::runtime::backend::ComputeBackend;
-use crate::runtime::eval::evaluate_training_data;
-use crate::runtime::sampling::{SamplingStrategy, StopCondition, generate_completion_with_backend};
+use crate::engine::checkpoint::load_inference_checkpoint;
+use crate::engine::device::{CpuBackend, GpuBackend, ResolvedDeviceKind, cpu_device, gpu_device};
+use crate::engine::generate::{SamplingStrategy, StopCondition, generate_completion};
+use crate::engine::train::evaluate_training_data;
 
 pub fn run_eval(command: EvalCommand) -> Result<()> {
-    let checkpoint = load_checkpoint(&command.checkpoint)?;
-    let backend = ComputeBackend::from_model(&checkpoint.model, command.eval.device)?;
+    let resolved = ResolvedDeviceKind::resolve(command.eval.device)?;
+    match resolved {
+        ResolvedDeviceKind::Cpu => run_eval_impl::<CpuBackend>(command, cpu_device(), resolved),
+        ResolvedDeviceKind::Gpu => run_eval_impl::<GpuBackend>(command, gpu_device(), resolved),
+    }
+}
+
+fn run_eval_impl<B: Backend>(
+    command: EvalCommand,
+    device: B::Device,
+    resolved: ResolvedDeviceKind,
+) -> Result<()> {
+    let checkpoint = load_inference_checkpoint::<B>(&command.checkpoint, &device)?;
     let strategy = SamplingStrategy {
         temperature: command.eval.temperature,
         top_k: command.eval.top_k,
@@ -25,7 +38,7 @@ pub fn run_eval(command: EvalCommand) -> Result<()> {
         "RustGPT eval  checkpoint={}  trained_steps={}  backend={}",
         command.checkpoint.display(),
         checkpoint.trained_steps,
-        backend.description()
+        resolved.description()
     );
 
     if let Some(data_config) = &command.data {
@@ -38,11 +51,11 @@ pub fn run_eval(command: EvalCommand) -> Result<()> {
         )?;
         let metrics = evaluate_training_data(
             &checkpoint.model,
+            &checkpoint.tokenizer,
             &training_data,
-            &backend,
-            checkpoint.model.cfg.block_size,
+            checkpoint.model.config().block_size,
             command.eval.max_examples,
-            None,
+            &device,
         )?;
         println!(
             "eval_data={}  format={}  examples={}  mean_loss={:.4}  perplexity={:.4}",
@@ -83,9 +96,8 @@ pub fn run_eval(command: EvalCommand) -> Result<()> {
         let mut rng = Rng::from_seed(42);
         let mut failed_cases = Vec::new();
         for (prompt_idx, case) in prompt_cases.iter().enumerate() {
-            let completion = generate_completion_with_backend(
+            let completion = generate_completion(
                 &checkpoint.model,
-                &backend,
                 &checkpoint.tokenizer,
                 &case.prompt,
                 case.max_new_tokens.unwrap_or(command.eval.max_new_tokens),

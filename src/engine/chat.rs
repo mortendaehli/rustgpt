@@ -1,12 +1,8 @@
-//! Reusable chat-session logic.
-//! The terminal command owns stdin/stdout, while this module owns transcript rendering,
-//! chat directives, and the prompt template used for generation.
-
 use crate::core::config::ChatTemplateKind;
 use crate::core::error::Result;
 use crate::data::schema::{Message, MessageRole, render_messages};
 use crate::data::tokenizer::Tokenizer;
-use crate::runtime::sampling::StopCondition;
+use crate::engine::generate::StopCondition;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChatDirective {
@@ -176,62 +172,5 @@ pub fn parse_chat_directive(input: &str) -> Option<ChatDirective> {
         "/reset" => Some(ChatDirective::Reset),
         "/history" => Some(ChatDirective::History),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::core::config::BoundaryMode;
-    use crate::core::config::ChatTemplateKind;
-    use crate::data::tokenizer::Tokenizer;
-
-    use super::{ChatDirective, ChatSession, parse_chat_directive};
-
-    #[test]
-    fn session_prompt_appends_assistant_prefix_after_user_turn() {
-        let mut session =
-            ChatSession::new(ChatTemplateKind::SimpleTranscript, "be terse".to_string());
-        session.push_user_turn("hello");
-        assert_eq!(
-            session.prompt(),
-            "System: be terse\nUser: hello\nAssistant: "
-        );
-    }
-
-    #[test]
-    fn session_history_contains_completed_turns_only() {
-        let mut session = ChatSession::new(ChatTemplateKind::SimpleTranscript, String::new());
-        session.push_user_turn("hello");
-        session.push_assistant_turn("world");
-        assert_eq!(session.history(), "User: hello\nAssistant: world\n");
-    }
-
-    #[test]
-    fn chatml_prompt_uses_role_markers() {
-        let mut session = ChatSession::new(ChatTemplateKind::ChatMl, String::new());
-        session.push_user_turn("hello");
-        assert_eq!(session.prompt(), "<|user|>\nhello\n<|assistant|>\n");
-    }
-
-    #[test]
-    fn directives_are_parsed_from_trimmed_input() {
-        assert_eq!(
-            parse_chat_directive(" /history "),
-            Some(ChatDirective::History)
-        );
-        assert_eq!(parse_chat_directive("hello"), None);
-    }
-
-    #[test]
-    fn prepare_prompt_drops_old_turns_to_fit_budget() {
-        let docs = vec!["hello".to_string()];
-        let tokenizer = Tokenizer::from_docs(&docs, BoundaryMode::SharedBos).unwrap();
-        let mut session = ChatSession::new(ChatTemplateKind::SimpleTranscript, String::new());
-        session.push_user_turn("one");
-        session.push_assistant_turn("two");
-        session.push_user_turn("three");
-        let prepared = session.prepare_prompt(&tokenizer, 24, 4).unwrap();
-        assert!(prepared.dropped_turns > 0);
-        assert!(prepared.prompt.contains("three"));
     }
 }

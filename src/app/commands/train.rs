@@ -1,23 +1,57 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use burn::tensor::backend::{AutodiffBackend, Backend};
+
 use crate::app::cli::{InspectVocabCommand, TrainCommand};
 use crate::core::error::Result;
-use crate::data::checkpoint::save_checkpoint;
 use crate::data::corpus::Dataset;
 use crate::data::tokenizer::Tokenizer;
-use crate::runtime::backend::ComputeBackend;
-use crate::runtime::profile::RuntimeProfile;
-use crate::runtime::training::{prepare_training_run, run_training_steps};
+use crate::engine::checkpoint::{load_training_checkpoint, save_training_checkpoint};
+use crate::engine::device::{
+    CpuAutodiffBackend, CpuBackend, GpuAutodiffBackend, GpuBackend, ResolvedDeviceKind, cpu_device,
+    gpu_device,
+};
+use crate::engine::model::{LanguageModel, LanguageModelOptimizer};
+use crate::engine::profile::RuntimeProfile;
+use crate::engine::train::{TrainingArtifacts, prepare_training_run, run_training_steps};
 
 pub fn run_train(command: TrainCommand) -> Result<()> {
-    let mut prepared = prepare_training_run(
+    let resolved = ResolvedDeviceKind::resolve(command.train.device)?;
+    match resolved {
+        ResolvedDeviceKind::Cpu => {
+            run_train_impl::<CpuBackend, CpuAutodiffBackend>(command, cpu_device(), resolved)
+        }
+        ResolvedDeviceKind::Gpu => {
+            run_train_impl::<GpuBackend, GpuAutodiffBackend>(command, gpu_device(), resolved)
+        }
+    }
+}
+
+fn run_train_impl<B, AD>(
+    command: TrainCommand,
+    device: AD::Device,
+    resolved: ResolvedDeviceKind,
+) -> Result<()>
+where
+    B: Backend<Device = AD::Device>,
+    AD: AutodiffBackend<InnerBackend = B>,
+{
+    let prepared = prepare_training_run(
         &command.data,
         &command.train,
         command.validation_data.as_ref(),
         command.resume.as_deref(),
     )?;
-    let mut backend = ComputeBackend::from_model(&prepared.model, command.train.device)?;
+    let artifacts = if let Some(resume_path) = command.resume.as_deref() {
+        let loaded = load_training_checkpoint::<AD>(resume_path, &device, &command.train)?;
+        TrainingArtifacts {
+            model: loaded.model,
+            optimizer: loaded.optimizer,
+        }
+    } else {
+        TrainingArtifacts::new(&prepared.model_config, &command.train, &device)?
+    };
     let best_checkpoint_path = command.best_checkpoint_out.clone().or_else(|| {
         prepared.validation_data.as_ref().and_then(|_| {
             command
@@ -30,14 +64,14 @@ pub fn run_train(command: TrainCommand) -> Result<()> {
     println!(
         "RustGPT  vocab={}  params={}  layers={}  embd={}  heads={}  kv_heads={}  tied_embeddings={}  activation={}  position={}  tokenizer={}",
         prepared.tokenizer.vocab_size(),
-        prepared.model.num_parameters(),
-        prepared.model.cfg.n_layer,
-        prepared.model.cfg.n_embd,
-        prepared.model.cfg.n_head,
-        prepared.model.cfg.n_kv_head,
-        prepared.model.uses_tied_embeddings(),
-        prepared.model.cfg.activation,
-        prepared.model.cfg.position_encoding,
+        artifacts.model.num_parameters(),
+        prepared.model_config.n_layer,
+        prepared.model_config.n_embd,
+        prepared.model_config.n_head,
+        prepared.model_config.n_kv_head,
+        prepared.model_config.tie_embeddings,
+        prepared.model_config.activation,
+        prepared.model_config.position_encoding,
         prepared.tokenizer.kind_name()
     );
     println!(
@@ -53,7 +87,7 @@ pub fn run_train(command: TrainCommand) -> Result<()> {
     );
     let train_windows = prepared
         .training_data
-        .window_summary(prepared.model.cfg.block_size);
+        .window_summary(prepared.model_config.block_size);
     println!(
         "train_windows={}  source_sequences={}  multi_window_sequences={}  max_windows_per_sequence={}",
         train_windows.total_windows,
@@ -76,10 +110,10 @@ pub fn run_train(command: TrainCommand) -> Result<()> {
         command.train.seed,
         command.train.mode,
         prepared.tokenizer.boundary_mode(),
-        backend.description()
+        resolved.description()
     );
     if let Some(validation_data) = prepared.validation_data.as_ref() {
-        let validation_windows = validation_data.window_summary(prepared.model.cfg.block_size);
+        let validation_windows = validation_data.window_summary(prepared.model_config.block_size);
         println!(
             "validation_examples={}  validation_source_sequences={}  validation_multi_window_sequences={}  validation_max_windows_per_sequence={}  validation_max_examples={}  best_checkpoint={}",
             validation_windows.total_windows,
@@ -98,38 +132,31 @@ pub fn run_train(command: TrainCommand) -> Result<()> {
     let tokenizer_for_best = prepared.tokenizer.clone();
     let chat_template = prepared.chat_template;
     let checkpoint_seed = prepared.checkpoint_seed;
-    let mut best_validation_loss = None::<f32>;
     let mut save_best = |trained_steps: usize,
-                         validation_loss: f32,
-                         model: &mut crate::model::Model,
-                         backend: &mut ComputeBackend|
+                         _validation_loss: f32,
+                         model: &LanguageModel<AD>,
+                         optimizer: &LanguageModelOptimizer<AD>|
      -> Result<()> {
-        if best_validation_loss
-            .map(|best| validation_loss < best)
-            .unwrap_or(true)
-        {
-            best_validation_loss = Some(validation_loss);
-            if let Some(path) = best_checkpoint_path.as_ref() {
-                backend.download_model(model)?;
-                save_checkpoint(
-                    path,
-                    model,
-                    &tokenizer_for_best,
-                    chat_template,
-                    trained_steps,
-                    checkpoint_seed,
-                )?;
-            }
+        if let Some(path) = best_checkpoint_path.as_ref() {
+            save_training_checkpoint(
+                path,
+                model,
+                Some(optimizer),
+                &tokenizer_for_best,
+                chat_template,
+                trained_steps,
+                checkpoint_seed,
+            )?;
         }
         Ok(())
     };
-    let summary = run_training_steps(
-        &mut prepared.model,
+    let (artifacts, summary) = run_training_steps::<B, AD>(
+        artifacts,
         &prepared.tokenizer,
         &prepared.training_data,
-        &mut backend,
         &command.train,
         prepared.starting_step,
+        &device,
         runtime_profile.as_ref(),
         true,
         prepared.validation_data.as_ref(),
@@ -139,9 +166,10 @@ pub fn run_train(command: TrainCommand) -> Result<()> {
     for entry in &summary.log_entries {
         if let Some(validation_loss) = entry.validation_loss {
             println!(
-                "step {:>5} / {:>5}  loss={:.4}  val={:.4}  best_val={:.4}  lr={:.5}  batch={}  t={:.2?}  doc={:?}",
-                entry.step,
+                "step {:>5} / {:>5}  total_step={:>5}  loss={:.4}  val={:.4}  best_val={:.4}  lr={:.5}  batch={}  t={:.2?}  doc={:?}",
+                entry.run_step,
                 command.train.steps,
+                entry.total_step,
                 entry.loss,
                 validation_loss,
                 entry.best_validation_loss.unwrap_or(validation_loss),
@@ -152,9 +180,10 @@ pub fn run_train(command: TrainCommand) -> Result<()> {
             );
         } else {
             println!(
-                "step {:>5} / {:>5}  loss={:.4}  lr={:.5}  batch={}  t={:.2?}  doc={:?}",
-                entry.step,
+                "step {:>5} / {:>5}  total_step={:>5}  loss={:.4}  lr={:.5}  batch={}  t={:.2?}  doc={:?}",
+                entry.run_step,
                 command.train.steps,
+                entry.total_step,
                 entry.loss,
                 entry.learning_rate,
                 entry.batch_size,
@@ -191,10 +220,10 @@ pub fn run_train(command: TrainCommand) -> Result<()> {
     }
 
     if let Some(checkpoint_out) = &command.checkpoint_out {
-        backend.download_model(&mut prepared.model)?;
-        save_checkpoint(
+        save_training_checkpoint(
             checkpoint_out,
-            &prepared.model,
+            &artifacts.model,
+            Some(&artifacts.optimizer),
             &prepared.tokenizer,
             prepared.chat_template,
             prepared.starting_step + command.train.steps,
@@ -261,35 +290,9 @@ pub fn run_inspect_vocab(command: InspectVocabCommand) -> Result<()> {
         println!("{token_id:>4}  {}", tokenizer.token_label(token_id)?);
         shown += 1;
     }
-
-    if shown < command.inspect.show_tokens {
-        for token_id in [
-            tokenizer.bos_id(),
-            tokenizer.eos_id().unwrap_or(tokenizer.bos_id()),
-        ] {
-            if shown >= command.inspect.show_tokens {
-                break;
-            }
-            println!("{token_id:>4}  {}", tokenizer.token_label(token_id)?);
-            shown += 1;
-        }
-    }
-
-    if let Some(first_doc) = rendered_docs.first() {
-        let encoded = tokenizer.encode_with_boundaries(first_doc)?;
-        println!();
-        println!("first doc        {:?}", truncate_string(first_doc, 48));
-        println!("encoded          {:?}", encoded);
-        println!("decoded          {:?}", tokenizer.decode(&encoded, false)?);
+    if shown == 0 {
+        println!("no tokens found");
     }
 
     Ok(())
-}
-
-fn truncate_string(input: &str, max_chars: usize) -> String {
-    let mut out = input.chars().take(max_chars).collect::<String>();
-    if input.chars().count() > max_chars {
-        out.push_str("...");
-    }
-    out
 }

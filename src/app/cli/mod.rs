@@ -346,6 +346,8 @@ fn parse_train(bin: &str, args: Vec<String>) -> Result<Command> {
         }
     }
 
+    validate_train_surface(&train)?;
+
     Ok(Command::Train(TrainCommand {
         data,
         train,
@@ -896,6 +898,32 @@ fn parse_position_encoding_kind(
             "invalid value for {flag}: {value:?}. Expected learned or rope."
         ))
     })
+}
+
+fn validate_train_surface(train: &TrainConfig) -> Result<()> {
+    if train.sample_every == 0 {
+        return Err(RustGptError::Cli(
+            "invalid value for --sample-every: expected an integer >= 1".to_string(),
+        ));
+    }
+    if train.validation_max_examples == 0 {
+        return Err(RustGptError::Cli(
+            "invalid value for --valid-max-examples: expected an integer >= 1".to_string(),
+        ));
+    }
+    if train.position_encoding != PositionEncodingKind::LearnedAbsolute {
+        return Err(RustGptError::Cli(
+            "the Burn runtime currently supports only --position learned".to_string(),
+        ));
+    }
+    if train.n_kv_head != 0 && train.n_kv_head != train.n_head {
+        return Err(RustGptError::Cli(format!(
+            "the Burn runtime currently supports only --n-kv-head matching --n-head (got {} vs {})",
+            train.n_kv_head, train.n_head
+        )));
+    }
+
+    Ok(())
 }
 
 fn parse_lr_schedule_kind(args: &[String], idx: usize, flag: &str) -> Result<LrScheduleKind> {

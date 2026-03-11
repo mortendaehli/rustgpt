@@ -1,6 +1,7 @@
 pub mod bench;
 pub mod chat;
 pub mod eval;
+pub mod gpu_info;
 pub mod prepare_data;
 pub mod sample;
 pub mod train;
