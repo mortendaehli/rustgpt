@@ -28,9 +28,16 @@ where
         app::cli::Command::InspectVocab(command) => {
             app::commands::train::run_inspect_vocab(command)
         }
+        app::cli::Command::PrepareData(command) => {
+            app::commands::prepare_data::run_prepare_data(command)
+        }
+        app::cli::Command::TrainTokenizer(command) => {
+            app::commands::train_tokenizer::run_train_tokenizer(command)
+        }
         app::cli::Command::Sample(command) => app::commands::sample::run_sample(command),
         app::cli::Command::BenchSample(command) => app::commands::bench::run_bench_sample(command),
         app::cli::Command::Chat(command) => app::commands::chat::run_chat(command),
+        app::cli::Command::Eval(command) => app::commands::eval::run_eval(command),
         app::cli::Command::GpuInfo(command) => runtime::backend::run_gpu_info(command),
     }
 }

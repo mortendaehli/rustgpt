@@ -56,6 +56,16 @@ struct GpuRuntime {
     add_pipeline: wgpu::ComputePipeline,
     relu_pipeline: wgpu::ComputePipeline,
     relu_backward_pipeline: wgpu::ComputePipeline,
+    gelu_pipeline: wgpu::ComputePipeline,
+    gelu_backward_pipeline: wgpu::ComputePipeline,
+    silu_pipeline: wgpu::ComputePipeline,
+    silu_backward_pipeline: wgpu::ComputePipeline,
+    mul_pipeline: wgpu::ComputePipeline,
+    expand_gqa_rows_pipeline: wgpu::ComputePipeline,
+    collapse_gqa_rows_pipeline: wgpu::ComputePipeline,
+    rope_pipeline: wgpu::ComputePipeline,
+    rope_rows_pipeline: wgpu::ComputePipeline,
+    rope_rows_backward_pipeline: wgpu::ComputePipeline,
     rmsnorm_pipeline: wgpu::ComputePipeline,
     rmsnorm_backward_pipeline: wgpu::ComputePipeline,
     rmsnorm_rows_pipeline: wgpu::ComputePipeline,
@@ -184,6 +194,76 @@ impl GpuRuntime {
             "rustgpt-relu-backward-pipeline",
             "rustgpt-relu-backward-shader",
             RELU_BACKWARD_SHADER,
+        );
+        let gelu_pipeline = create_pipeline(
+            &device,
+            &unary_bind_group_layout,
+            "rustgpt-gelu-pipeline",
+            "rustgpt-gelu-shader",
+            GELU_SHADER,
+        );
+        let gelu_backward_pipeline = create_pipeline(
+            &device,
+            &binary_bind_group_layout,
+            "rustgpt-gelu-backward-pipeline",
+            "rustgpt-gelu-backward-shader",
+            GELU_BACKWARD_SHADER,
+        );
+        let silu_pipeline = create_pipeline(
+            &device,
+            &unary_bind_group_layout,
+            "rustgpt-silu-pipeline",
+            "rustgpt-silu-shader",
+            SILU_SHADER,
+        );
+        let silu_backward_pipeline = create_pipeline(
+            &device,
+            &binary_bind_group_layout,
+            "rustgpt-silu-backward-pipeline",
+            "rustgpt-silu-backward-shader",
+            SILU_BACKWARD_SHADER,
+        );
+        let mul_pipeline = create_pipeline(
+            &device,
+            &binary_bind_group_layout,
+            "rustgpt-mul-pipeline",
+            "rustgpt-mul-shader",
+            MUL_SHADER,
+        );
+        let expand_gqa_rows_pipeline = create_pipeline(
+            &device,
+            &unary_bind_group_layout,
+            "rustgpt-expand-gqa-rows-pipeline",
+            "rustgpt-expand-gqa-rows-shader",
+            EXPAND_GQA_ROWS_SHADER,
+        );
+        let collapse_gqa_rows_pipeline = create_pipeline(
+            &device,
+            &unary_bind_group_layout,
+            "rustgpt-collapse-gqa-rows-pipeline",
+            "rustgpt-collapse-gqa-rows-shader",
+            COLLAPSE_GQA_ROWS_SHADER,
+        );
+        let rope_pipeline = create_pipeline(
+            &device,
+            &unary_bind_group_layout,
+            "rustgpt-rope-pipeline",
+            "rustgpt-rope-shader",
+            ROPE_SHADER,
+        );
+        let rope_rows_pipeline = create_pipeline(
+            &device,
+            &unary_bind_group_layout,
+            "rustgpt-rope-rows-pipeline",
+            "rustgpt-rope-rows-shader",
+            ROPE_ROWS_SHADER,
+        );
+        let rope_rows_backward_pipeline = create_pipeline(
+            &device,
+            &unary_bind_group_layout,
+            "rustgpt-rope-rows-backward-pipeline",
+            "rustgpt-rope-rows-backward-shader",
+            ROPE_ROWS_BACKWARD_SHADER,
         );
         let rmsnorm_pipeline = create_pipeline(
             &device,
@@ -326,6 +406,16 @@ impl GpuRuntime {
             add_pipeline,
             relu_pipeline,
             relu_backward_pipeline,
+            gelu_pipeline,
+            gelu_backward_pipeline,
+            silu_pipeline,
+            silu_backward_pipeline,
+            mul_pipeline,
+            expand_gqa_rows_pipeline,
+            collapse_gqa_rows_pipeline,
+            rope_pipeline,
+            rope_rows_pipeline,
+            rope_rows_backward_pipeline,
             rmsnorm_pipeline,
             rmsnorm_backward_pipeline,
             rmsnorm_rows_pipeline,
@@ -596,6 +686,7 @@ impl GpuRuntime {
         beta1: f32,
         beta2: f32,
         eps_adam: f32,
+        weight_decay: f32,
         optimizer_step_num: usize,
     ) -> Result<()> {
         let len = matrix.rows * matrix.cols;
@@ -605,7 +696,7 @@ impl GpuRuntime {
             let chunk_len = usize::min(max_elements_per_dispatch, len - offset);
             let params_bytes = adam_params_to_bytes(
                 &[len as u32, optimizer_step_num as u32, offset as u32, 0_u32],
-                &[lr_t, beta1, beta2, eps_adam],
+                &[lr_t, beta1, beta2, eps_adam, weight_decay, 0.0, 0.0, 0.0],
             );
             let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rustgpt-adam-params"),
@@ -823,6 +914,23 @@ impl GpuRuntime {
         matrix.grad = self.readback_f32_buffer(&gpu_matrix.grad_buffer, matrix.grad.len())?;
         matrix.m = self.readback_f32_buffer(&gpu_matrix.m_buffer, matrix.m.len())?;
         matrix.v = self.readback_f32_buffer(&gpu_matrix.v_buffer, matrix.v.len())?;
+        Ok(())
+    }
+
+    fn download_gradients(&self, gpu_matrix: &GpuMatrix) -> Result<Vec<f32>> {
+        self.readback_f32_buffer(&gpu_matrix.grad_buffer, gpu_matrix.rows * gpu_matrix.cols)
+    }
+
+    fn upload_gradients(&self, gpu_matrix: &GpuMatrix, grad: &[f32]) -> Result<()> {
+        if grad.len() != gpu_matrix.rows * gpu_matrix.cols {
+            return Err(RustGptError::Gpu(format!(
+                "gradient upload length mismatch: {} vs {}",
+                grad.len(),
+                gpu_matrix.rows * gpu_matrix.cols
+            )));
+        }
+        self.queue
+            .write_buffer(&gpu_matrix.grad_buffer, 0, &f32s_to_bytes(grad));
         Ok(())
     }
 
@@ -1084,6 +1192,224 @@ impl GpuRuntime {
             "rustgpt-relu",
             &[x.len as u32, 0, 0, 0],
             WORKGROUP_SIZE,
+        )
+    }
+
+    fn gelu(&self, x: &GpuVector) -> Result<GpuVector> {
+        self.run_unary_vector_op(
+            x,
+            &self.gelu_pipeline,
+            "rustgpt-gelu",
+            &[x.len as u32, 0, 0, 0],
+            WORKGROUP_SIZE,
+        )
+    }
+
+    fn silu(&self, x: &GpuVector) -> Result<GpuVector> {
+        self.run_unary_vector_op(
+            x,
+            &self.silu_pipeline,
+            "rustgpt-silu",
+            &[x.len as u32, 0, 0, 0],
+            WORKGROUP_SIZE,
+        )
+    }
+
+    fn mul(&self, left: &GpuVector, right: &GpuVector) -> Result<GpuVector> {
+        self.run_binary_vector_op(
+            left,
+            right,
+            &self.mul_pipeline,
+            "rustgpt-mul",
+            WORKGROUP_SIZE,
+        )
+    }
+
+    fn expand_grouped_heads_rows(
+        &self,
+        x: &GpuVector,
+        rows: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+    ) -> Result<GpuVector> {
+        let out_len = rows
+            .checked_mul(n_head)
+            .and_then(|value| value.checked_mul(head_dim))
+            .ok_or_else(|| {
+                RustGptError::Gpu("expand_grouped_heads_rows size overflow".to_string())
+            })?;
+        let out = self.create_storage_buffer(
+            out_len,
+            "rustgpt-expand-gqa-rows",
+            wgpu::BufferUsages::empty(),
+        )?;
+        let params = [
+            rows as u32,
+            n_head as u32,
+            n_kv_head as u32,
+            head_dim as u32,
+        ];
+        let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rustgpt-expand-gqa-rows-params"),
+            size: byte_len(params.len(), std::mem::size_of::<u32>())?,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&params_buffer, 0, &u32s_to_bytes(&params));
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rustgpt-expand-gqa-rows-bind-group"),
+            layout: &self.unary_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: x.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rustgpt-expand-gqa-rows-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rustgpt-expand-gqa-rows-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.expand_gqa_rows_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups((out_len as u32).div_ceil(WORKGROUP_SIZE), 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(GpuVector {
+            len: out_len,
+            buffer: out,
+        })
+    }
+
+    fn collapse_grouped_heads_rows(
+        &self,
+        x: &GpuVector,
+        rows: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+    ) -> Result<GpuVector> {
+        let out_len = rows
+            .checked_mul(n_kv_head)
+            .and_then(|value| value.checked_mul(head_dim))
+            .ok_or_else(|| {
+                RustGptError::Gpu("collapse_grouped_heads_rows size overflow".to_string())
+            })?;
+        let out = self.create_storage_buffer(
+            out_len,
+            "rustgpt-collapse-gqa-rows",
+            wgpu::BufferUsages::empty(),
+        )?;
+        let params = [
+            rows as u32,
+            n_head as u32,
+            n_kv_head as u32,
+            head_dim as u32,
+        ];
+        let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rustgpt-collapse-gqa-rows-params"),
+            size: byte_len(params.len(), std::mem::size_of::<u32>())?,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&params_buffer, 0, &u32s_to_bytes(&params));
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rustgpt-collapse-gqa-rows-bind-group"),
+            layout: &self.unary_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: x.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rustgpt-collapse-gqa-rows-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("rustgpt-collapse-gqa-rows-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.collapse_gqa_rows_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups((out_len as u32).div_ceil(WORKGROUP_SIZE), 1, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        Ok(GpuVector {
+            len: out_len,
+            buffer: out,
+        })
+    }
+
+    fn rope(&self, x: &GpuVector, pos_id: usize, head_dim: usize) -> Result<GpuVector> {
+        self.run_unary_vector_op(
+            x,
+            &self.rope_pipeline,
+            "rustgpt-rope",
+            &[x.len as u32, pos_id as u32, head_dim as u32, 0],
+            WORKGROUP_SIZE,
+        )
+    }
+
+    fn rope_rows(
+        &self,
+        x: &GpuVector,
+        rows: usize,
+        cols: usize,
+        seq_len: usize,
+        head_dim: usize,
+    ) -> Result<GpuVector> {
+        self.run_unary_vector_op(
+            x,
+            &self.rope_rows_pipeline,
+            "rustgpt-rope-rows",
+            &[rows as u32, cols as u32, seq_len as u32, head_dim as u32],
+            (x.len as u32).div_ceil(WORKGROUP_SIZE),
+        )
+    }
+
+    fn rope_rows_inverse(
+        &self,
+        x: &GpuVector,
+        rows: usize,
+        cols: usize,
+        seq_len: usize,
+        head_dim: usize,
+    ) -> Result<GpuVector> {
+        self.run_unary_vector_op(
+            x,
+            &self.rope_rows_backward_pipeline,
+            "rustgpt-rope-rows-inverse",
+            &[rows as u32, cols as u32, seq_len as u32, head_dim as u32],
+            (x.len as u32).div_ceil(WORKGROUP_SIZE),
         )
     }
 
@@ -1921,7 +2247,7 @@ impl GpuRuntime {
         token_ids: &GpuIndexVector,
         d_embed: &GpuVector,
         wte: &GpuMatrix,
-        wpe: &GpuMatrix,
+        wpe: Option<&GpuMatrix>,
         seq_len: usize,
         n_embd: usize,
     ) -> Result<()> {
@@ -1948,6 +2274,19 @@ impl GpuRuntime {
         });
         self.queue
             .write_buffer(&params_buffer, 0, &u32s_to_bytes(&params));
+        let scratch_wpe_grad = if wpe.is_none() {
+            Some(self.create_storage_buffer(
+                seq_len * n_embd,
+                "rustgpt-scatter-embed-grads-scratch-wpe",
+                wgpu::BufferUsages::empty(),
+            )?)
+        } else {
+            None
+        };
+        let wpe_binding = wpe
+            .map(|matrix| &matrix.grad_buffer)
+            .or(scratch_wpe_grad.as_ref())
+            .expect("scratch buffer must exist when learned positions are absent");
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rustgpt-scatter-embed-grads-bind-group"),
             layout: &self.scatter_embed_bind_group_layout,
@@ -1966,7 +2305,7 @@ impl GpuRuntime {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wpe.grad_buffer.as_entire_binding(),
+                    resource: wpe_binding.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -1996,6 +2335,7 @@ impl GpuRuntime {
         &self,
         probs: &GpuVector,
         target_ids: &GpuIndexVector,
+        loss_weights: &GpuVector,
         rows: usize,
         cols: usize,
         norm: f32,
@@ -2010,6 +2350,12 @@ impl GpuRuntime {
             return Err(RustGptError::Gpu(format!(
                 "cross entropy target mismatch: {} vs {}",
                 target_ids.len, rows
+            )));
+        }
+        if loss_weights.len != rows {
+            return Err(RustGptError::Gpu(format!(
+                "cross entropy weight mismatch: {} vs {}",
+                loss_weights.len, rows
             )));
         }
 
@@ -2051,14 +2397,18 @@ impl GpuRuntime {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: d_logits.as_entire_binding(),
+                    resource: loss_weights.buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: losses.as_entire_binding(),
+                    resource: d_logits.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
+                    resource: losses.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
                     resource: params_buffer.as_entire_binding(),
                 },
             ],
@@ -2513,6 +2863,36 @@ impl GpuRuntime {
         )
     }
 
+    fn gelu_backward_vector(
+        &self,
+        pre_activation: &GpuVector,
+        dout: &GpuVector,
+    ) -> Result<GpuVector> {
+        self.run_binary_vector_op_with_params(
+            pre_activation,
+            dout,
+            &self.gelu_backward_pipeline,
+            "rustgpt-gelu-backward",
+            &u32s_to_bytes(&[pre_activation.len as u32, 0, 0, 0]),
+            (pre_activation.len as u32).div_ceil(WORKGROUP_SIZE),
+        )
+    }
+
+    fn silu_backward_vector(
+        &self,
+        pre_activation: &GpuVector,
+        dout: &GpuVector,
+    ) -> Result<GpuVector> {
+        self.run_binary_vector_op_with_params(
+            pre_activation,
+            dout,
+            &self.silu_backward_pipeline,
+            "rustgpt-silu-backward",
+            &u32s_to_bytes(&[pre_activation.len as u32, 0, 0, 0]),
+            (pre_activation.len as u32).div_ceil(WORKGROUP_SIZE),
+        )
+    }
+
     fn rmsnorm_backward_vector(
         &self,
         x: &GpuVector,
@@ -2608,22 +2988,56 @@ impl GpuRuntime {
 
     fn backward_mlp_residual(
         &self,
+        activation: crate::core::config::ActivationKind,
         x_residual: &[f32],
         x_norm: &[f32],
         rms_inv: f32,
         mlp_hidden_pre: &[f32],
+        mlp_gate_pre: Option<&[f32]>,
         mlp_hidden_act: &[f32],
         d_mlp_out: &[f32],
         mlp_fc1: &GpuMatrix,
+        mlp_fc_gate: Option<&GpuMatrix>,
         mlp_fc2: &GpuMatrix,
     ) -> Result<Vec<f32>> {
         let d_out = self.upload_vector(d_mlp_out, "rustgpt-mlp-dout")?;
         self.accumulate_outer_product_from_vector(mlp_hidden_act, &d_out, mlp_fc2)?;
         let d_hidden_act = self.matvec_transposed_vector(&d_out, mlp_fc2)?;
-        let pre = self.upload_vector(mlp_hidden_pre, "rustgpt-mlp-pre")?;
-        let d_hidden_pre = self.relu_backward_vector(&pre, &d_hidden_act)?;
-        self.accumulate_outer_product_from_vector(x_norm, &d_hidden_pre, mlp_fc1)?;
-        let d_x_norm = self.matvec_transposed_vector(&d_hidden_pre, mlp_fc1)?;
+        let value_pre = self.upload_vector(mlp_hidden_pre, "rustgpt-mlp-pre")?;
+        let d_x_norm = match activation {
+            crate::core::config::ActivationKind::Relu => {
+                let d_hidden_pre = self.relu_backward_vector(&value_pre, &d_hidden_act)?;
+                self.accumulate_outer_product_from_vector(x_norm, &d_hidden_pre, mlp_fc1)?;
+                self.matvec_transposed_vector(&d_hidden_pre, mlp_fc1)?
+            }
+            crate::core::config::ActivationKind::Gelu => {
+                let d_hidden_pre = self.gelu_backward_vector(&value_pre, &d_hidden_act)?;
+                self.accumulate_outer_product_from_vector(x_norm, &d_hidden_pre, mlp_fc1)?;
+                self.matvec_transposed_vector(&d_hidden_pre, mlp_fc1)?
+            }
+            crate::core::config::ActivationKind::SwiGlu => {
+                let gate_pre = self.upload_vector(
+                    mlp_gate_pre.ok_or_else(|| {
+                        RustGptError::Gpu(
+                            "swiglu backward requires cached gate pre-activations".to_string(),
+                        )
+                    })?,
+                    "rustgpt-mlp-gate-pre",
+                )?;
+                let gate_act = self.silu(&gate_pre)?;
+                let d_value = self.mul(&d_hidden_act, &gate_act)?;
+                let d_gate_act = self.mul(&d_hidden_act, &value_pre)?;
+                let d_gate = self.silu_backward_vector(&gate_pre, &d_gate_act)?;
+                self.accumulate_outer_product_from_vector(x_norm, &d_value, mlp_fc1)?;
+                let d_x_norm = self.matvec_transposed_vector(&d_value, mlp_fc1)?;
+                let gate_matrix = mlp_fc_gate.ok_or_else(|| {
+                    RustGptError::Gpu("swiglu backward requires gate weights".to_string())
+                })?;
+                self.accumulate_outer_product_from_vector(x_norm, &d_gate, gate_matrix)?;
+                let d_x_norm_gate = self.matvec_transposed_vector(&d_gate, gate_matrix)?;
+                self.add(&d_x_norm, &d_x_norm_gate)?
+            }
+        };
         let x_residual_vec = self.upload_vector(x_residual, "rustgpt-mlp-residual")?;
         let d_x = self.rmsnorm_backward_vector(&x_residual_vec, rms_inv, &d_x_norm)?;
         self.readback_vector(&d_x)

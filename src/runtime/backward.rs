@@ -1,6 +1,8 @@
 use crate::core::error::Result;
 use crate::core::tensor::{add_in_place, rmsnorm_backward, softmax_backward};
 use crate::model::Model;
+use crate::model::attention::collapse_grouped_head_grads;
+use crate::model::position::apply_qk_position_gradient_in_place;
 use crate::runtime::backend::ComputeBackend;
 use crate::runtime::profile::{RuntimeProfile, measure};
 use crate::runtime::train_cache::SequenceForwardCache;
@@ -71,6 +73,7 @@ pub fn train_step_profiled(
         beta1,
         beta2,
         eps_adam,
+        0.0,
         optimizer_step_num,
         profile,
     )?;
@@ -99,11 +102,31 @@ pub fn apply_optimizer_profiled(
     beta1: f32,
     beta2: f32,
     eps_adam: f32,
+    weight_decay: f32,
     optimizer_step_num: usize,
     profile: Option<&RuntimeProfile>,
 ) -> Result<()> {
     measure(profile, "optimizer.adam", || {
-        backend.adam_step(model, lr_t, beta1, beta2, eps_adam, optimizer_step_num)
+        backend.adam_step(
+            model,
+            lr_t,
+            beta1,
+            beta2,
+            eps_adam,
+            weight_decay,
+            optimizer_step_num,
+        )
+    })
+}
+
+pub fn clip_gradients_profiled(
+    model: &mut Model,
+    backend: &mut ComputeBackend,
+    max_norm: f32,
+    profile: Option<&RuntimeProfile>,
+) -> Result<Option<f32>> {
+    measure(profile, "optimizer.clip_grad", || {
+        backend.clip_gradients(model, max_norm)
     })
 }
 
@@ -131,7 +154,8 @@ pub fn backward_sequence_profiled(
     }
 
     let seq_len = sequence.tokens.len();
-    let norm = sequence.grad_scale / seq_len as f32;
+    let loss_weight_sum = sequence.loss_weight_sum.max(f32::EPSILON);
+    let norm = sequence.grad_scale / loss_weight_sum;
     let mut kv_grad = KvGrad::new(model.cfg.n_layer, seq_len, model.cfg.n_embd);
 
     for pos in (0..seq_len).rev() {
@@ -157,15 +181,22 @@ fn backward_token(
     let mut d_logits = token_cache.probs.clone();
     d_logits[token_cache.target_id] -= 1.0;
     for value in &mut d_logits {
-        *value *= norm;
+        *value *= norm * token_cache.loss_weight;
     }
 
-    let mut dx = measure(profile, "backward.matvec_t", || {
-        backend.matvec_transposed(&d_logits, &model.lm_head)
-    })?;
+    let mut dx = {
+        let output_projection = model.output_projection();
+        measure(profile, "backward.matvec_t", || {
+            backend.matvec_transposed(&d_logits, output_projection)
+        })?
+    };
     measure(profile, "backward.grad_accum", || {
-        backend.accumulate_linear_grad(&token_cache.final_x, &d_logits, &mut model.lm_head)
+        let output_projection = model.output_projection_mut();
+        backend.accumulate_linear_grad(&token_cache.final_norm_x, &d_logits, output_projection)
     })?;
+    dx = measure(profile, "backward.rmsnorm", || {
+        rmsnorm_backward(&token_cache.final_x, token_cache.final_rms_inv, &dx)
+    });
 
     for layer_idx in (0..model.cfg.n_layer).rev() {
         let layer_cache = &token_cache.layers[layer_idx];
@@ -177,13 +208,16 @@ fn backward_token(
             let layer = &mut model.layers[layer_idx];
             measure(profile, "backward.mlp_block", || {
                 backend.backward_mlp_residual(
+                    model.cfg.activation,
                     &layer_cache.x_residual_mlp,
                     &layer_cache.x_norm_mlp,
                     layer_cache.rms_inv_mlp,
                     &layer_cache.mlp_hidden_pre,
+                    layer_cache.mlp_gate_pre.as_deref(),
                     &layer_cache.mlp_hidden_act,
                     &d_mlp_out,
                     &mut layer.mlp_fc1,
+                    layer.mlp_fc_gate.as_mut(),
                     &mut layer.mlp_fc2,
                 )
             })?
@@ -204,54 +238,89 @@ fn backward_token(
             )
         })?;
 
-        let (d_q, d_k_current, d_v_current) = measure(profile, "backward.attention", || {
-            let mut d_q = vec![0.0; model.cfg.n_embd];
-            let mut d_k_current = kv_grad.layers[layer_idx].key(pos).to_vec();
-            let mut d_v_current = kv_grad.layers[layer_idx].value(pos).to_vec();
-            let scale = (head_dim as f32).sqrt();
+        let (mut d_q, d_k_current_expanded, d_v_current_expanded) =
+            measure(profile, "backward.attention", || {
+                let mut d_q = vec![0.0; model.cfg.n_embd];
+                let mut d_k_current = kv_grad.layers[layer_idx].key(pos).to_vec();
+                let mut d_v_current = kv_grad.layers[layer_idx].value(pos).to_vec();
+                let scale = (head_dim as f32).sqrt();
 
-            for head_idx in 0..n_head {
-                let start = head_idx * head_dim;
-                let end = start + head_dim;
-                let d_head = &d_x_attn[start..end];
-                let q_slice = &layer_cache.q[start..end];
-                let head_weights = layer_cache.attn_weights.head(head_idx);
+                for head_idx in 0..n_head {
+                    let start = head_idx * head_dim;
+                    let end = start + head_dim;
+                    let d_head = &d_x_attn[start..end];
+                    let q_slice = &layer_cache.q[start..end];
+                    let head_weights = layer_cache.attn_weights.head(head_idx);
 
-                let mut d_weights = vec![0.0; pos + 1];
-                for t in 0..=pos {
-                    let v_slice = &sequence.tokens[t].layers[layer_idx].v[start..end];
-                    d_weights[t] = d_head.iter().zip(v_slice).map(|(a, b)| a * b).sum();
+                    let mut d_weights = vec![0.0; pos + 1];
+                    for t in 0..=pos {
+                        let v_slice = &sequence.tokens[t].layers[layer_idx].v[start..end];
+                        d_weights[t] = d_head.iter().zip(v_slice).map(|(a, b)| a * b).sum();
 
-                    let target_dv = if t == pos {
-                        &mut d_v_current[start..end]
-                    } else {
-                        &mut kv_grad.layers[layer_idx].value_mut(t)[start..end]
-                    };
-                    for feature_idx in 0..head_dim {
-                        target_dv[feature_idx] += d_head[feature_idx] * head_weights[t];
+                        let target_dv = if t == pos {
+                            &mut d_v_current[start..end]
+                        } else {
+                            &mut kv_grad.layers[layer_idx].value_mut(t)[start..end]
+                        };
+                        for feature_idx in 0..head_dim {
+                            target_dv[feature_idx] += d_head[feature_idx] * head_weights[t];
+                        }
+                    }
+
+                    let d_logits_attn = softmax_backward(head_weights, &d_weights);
+                    for t in 0..=pos {
+                        let k_slice = &sequence.tokens[t].layers[layer_idx].k[start..end];
+                        let d_logit = d_logits_attn[t];
+                        for feature_idx in 0..head_dim {
+                            d_q[start + feature_idx] += d_logit * k_slice[feature_idx] / scale;
+                        }
+
+                        let target_dk = if t == pos {
+                            &mut d_k_current[start..end]
+                        } else {
+                            &mut kv_grad.layers[layer_idx].key_mut(t)[start..end]
+                        };
+                        for feature_idx in 0..head_dim {
+                            target_dk[feature_idx] += d_logit * q_slice[feature_idx] / scale;
+                        }
                     }
                 }
 
-                let d_logits_attn = softmax_backward(head_weights, &d_weights);
-                for t in 0..=pos {
-                    let k_slice = &sequence.tokens[t].layers[layer_idx].k[start..end];
-                    let d_logit = d_logits_attn[t];
-                    for feature_idx in 0..head_dim {
-                        d_q[start + feature_idx] += d_logit * k_slice[feature_idx] / scale;
-                    }
+                (d_q, d_k_current, d_v_current)
+            });
 
-                    let target_dk = if t == pos {
-                        &mut d_k_current[start..end]
-                    } else {
-                        &mut kv_grad.layers[layer_idx].key_mut(t)[start..end]
-                    };
-                    for feature_idx in 0..head_dim {
-                        target_dk[feature_idx] += d_logit * q_slice[feature_idx] / scale;
-                    }
-                }
-            }
+        let mut d_k_current = measure(profile, "backward.attention_collapse", || {
+            collapse_grouped_head_grads(
+                &d_k_current_expanded,
+                model.cfg.n_head,
+                model.cfg.n_kv_head,
+                head_dim,
+            )
+        })?;
+        let d_v_current = measure(profile, "backward.attention_collapse", || {
+            collapse_grouped_head_grads(
+                &d_v_current_expanded,
+                model.cfg.n_head,
+                model.cfg.n_kv_head,
+                head_dim,
+            )
+        })?;
 
-            (d_q, d_k_current, d_v_current)
+        measure(profile, "backward.position", || {
+            apply_qk_position_gradient_in_place(
+                &mut d_q,
+                model.cfg.position_encoding,
+                token_cache.pos_id,
+                model.cfg.n_head,
+                head_dim,
+            );
+            apply_qk_position_gradient_in_place(
+                &mut d_k_current,
+                model.cfg.position_encoding,
+                token_cache.pos_id,
+                model.cfg.n_kv_head,
+                head_dim,
+            );
         });
 
         let d_x_from_norm_attn = {
@@ -280,16 +349,20 @@ fn backward_token(
     measure(profile, "backward.row_grad", || {
         backend.add_row_grad(token_cache.token_id, &d_embed_sum, &mut model.wte)
     })?;
-    measure(profile, "backward.row_grad", || {
-        backend.add_row_grad(token_cache.pos_id, &d_embed_sum, &mut model.wpe)
-    })?;
+    if let Some(wpe) = model.position_embedding_mut() {
+        measure(profile, "backward.row_grad", || {
+            backend.add_row_grad(token_cache.pos_id, &d_embed_sum, wpe)
+        })?;
+    }
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::core::config::{BoundaryMode, DeviceKind, ModelConfig};
+    use crate::core::config::{
+        ActivationKind, BoundaryMode, DeviceKind, ModelConfig, PositionEncodingKind,
+    };
     use crate::core::rng::Rng;
     use crate::data::tokenizer::Tokenizer;
     use crate::runtime::backend::ComputeBackend;
@@ -308,6 +381,10 @@ mod tests {
             n_layer: 1,
             n_embd: 16,
             n_head: 4,
+            n_kv_head: 4,
+            tie_embeddings: false,
+            activation: ActivationKind::Relu,
+            position_encoding: PositionEncodingKind::LearnedAbsolute,
             boundary_mode: BoundaryMode::SharedBos,
         };
         let mut rng = Rng::from_seed(42);
@@ -339,6 +416,10 @@ mod tests {
             n_layer: 1,
             n_embd: 16,
             n_head: 4,
+            n_kv_head: 4,
+            tie_embeddings: false,
+            activation: ActivationKind::Relu,
+            position_encoding: PositionEncodingKind::LearnedAbsolute,
             boundary_mode: BoundaryMode::SharedBos,
         };
         let mut rng = Rng::from_seed(42);

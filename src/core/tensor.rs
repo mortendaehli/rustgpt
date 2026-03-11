@@ -78,7 +78,25 @@ impl Matrix {
         self.grad.fill(0.0);
     }
 
-    pub fn adam_step(&mut self, lr_t: f32, beta1: f32, beta2: f32, eps: f32, step_num: usize) {
+    pub fn grad_squared_sum(&self) -> f32 {
+        self.grad.iter().map(|value| value * value).sum()
+    }
+
+    pub fn scale_gradients(&mut self, scale: f32) {
+        for value in &mut self.grad {
+            *value *= scale;
+        }
+    }
+
+    pub fn adam_step(
+        &mut self,
+        lr_t: f32,
+        beta1: f32,
+        beta2: f32,
+        eps: f32,
+        weight_decay: f32,
+        step_num: usize,
+    ) {
         let step_num = step_num as i32;
         for idx in 0..self.data.len() {
             let grad = self.grad[idx];
@@ -86,6 +104,9 @@ impl Matrix {
             self.v[idx] = beta2 * self.v[idx] + (1.0 - beta2) * grad * grad;
             let m_hat = self.m[idx] / (1.0 - beta1.powi(step_num));
             let v_hat = self.v[idx] / (1.0 - beta2.powi(step_num));
+            if weight_decay > 0.0 {
+                self.data[idx] -= lr_t * weight_decay * self.data[idx];
+            }
             self.data[idx] -= lr_t * m_hat / (v_hat.sqrt() + eps);
             self.grad[idx] = 0.0;
         }
@@ -151,6 +172,29 @@ pub fn relu(x: &[f32]) -> Vec<f32> {
     x.iter().map(|value| value.max(0.0)).collect()
 }
 
+pub fn gelu(x: &[f32]) -> Vec<f32> {
+    x.iter().map(|value| gelu_scalar(*value)).collect()
+}
+
+pub fn silu(x: &[f32]) -> Vec<f32> {
+    x.iter().map(|value| silu_scalar(*value)).collect()
+}
+
+pub fn swiglu(value: &[f32], gate: &[f32]) -> Result<Vec<f32>> {
+    if value.len() != gate.len() {
+        return Err(RustGptError::Tensor(format!(
+            "swiglu shape mismatch: value has {} elements, gate has {}",
+            value.len(),
+            gate.len()
+        )));
+    }
+    Ok(value
+        .iter()
+        .zip(gate)
+        .map(|(value, gate)| value * silu_scalar(*gate))
+        .collect())
+}
+
 pub fn accumulate_linear_grad(x: &[f32], dout: &[f32], w: &mut Matrix) -> Result<()> {
     let cols = w.cols;
     let rows = w.rows;
@@ -204,6 +248,45 @@ pub fn relu_backward(pre_activation: &[f32], dout: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+pub fn gelu_backward(pre_activation: &[f32], dout: &[f32]) -> Vec<f32> {
+    pre_activation
+        .iter()
+        .zip(dout)
+        .map(|(pre, grad)| gelu_derivative_scalar(*pre) * *grad)
+        .collect()
+}
+
+pub fn silu_backward(pre_activation: &[f32], dout: &[f32]) -> Vec<f32> {
+    pre_activation
+        .iter()
+        .zip(dout)
+        .map(|(pre, grad)| silu_derivative_scalar(*pre) * *grad)
+        .collect()
+}
+
+pub fn swiglu_backward(
+    value_pre: &[f32],
+    gate_pre: &[f32],
+    dout: &[f32],
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    if value_pre.len() != gate_pre.len() || value_pre.len() != dout.len() {
+        return Err(RustGptError::Tensor(format!(
+            "swiglu_backward shape mismatch: value={} gate={} dout={}",
+            value_pre.len(),
+            gate_pre.len(),
+            dout.len()
+        )));
+    }
+    let mut d_value = vec![0.0; value_pre.len()];
+    let mut d_gate = vec![0.0; gate_pre.len()];
+    for idx in 0..value_pre.len() {
+        let silu_gate = silu_scalar(gate_pre[idx]);
+        d_value[idx] = dout[idx] * silu_gate;
+        d_gate[idx] = dout[idx] * value_pre[idx] * silu_derivative_scalar(gate_pre[idx]);
+    }
+    Ok((d_value, d_gate))
+}
+
 pub fn softmax_backward(probs: &[f32], dprobs: &[f32]) -> Vec<f32> {
     let dot = probs.iter().zip(dprobs).map(|(p, d)| p * d).sum::<f32>();
     probs
@@ -219,11 +302,37 @@ pub fn add_in_place(target: &mut [f32], source: &[f32]) {
     }
 }
 
+fn gelu_scalar(x: f32) -> f32 {
+    // The tanh form is the standard practical GELU approximation used in many implementations.
+    let cubic = x * x * x;
+    let inner = 0.797_884_6_f32 * (x + 0.044_715_f32 * cubic);
+    0.5 * x * (1.0 + inner.tanh())
+}
+
+fn silu_scalar(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+fn gelu_derivative_scalar(x: f32) -> f32 {
+    let cubic = x * x * x;
+    let inner = 0.797_884_6_f32 * (x + 0.044_715_f32 * cubic);
+    let tanh_inner = inner.tanh();
+    let sech2 = 1.0 - tanh_inner * tanh_inner;
+    let inner_prime = 0.797_884_6_f32 * (1.0 + 3.0 * 0.044_715_f32 * x * x);
+    0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * inner_prime
+}
+
+fn silu_derivative_scalar(x: f32) -> f32 {
+    let sigmoid = 1.0 / (1.0 + (-x).exp());
+    sigmoid * (1.0 + x * (1.0 - sigmoid))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Matrix, accumulate_linear_grad, add_in_place, linear, linear_backward, linear_transposed,
-        relu, relu_backward, rmsnorm, rmsnorm_backward, softmax, softmax_backward,
+        Matrix, accumulate_linear_grad, add_in_place, gelu, gelu_backward, linear, linear_backward,
+        linear_transposed, relu, relu_backward, rmsnorm, rmsnorm_backward, silu, silu_backward,
+        softmax, softmax_backward, swiglu, swiglu_backward,
     };
 
     #[test]
@@ -256,6 +365,50 @@ mod tests {
         assert_eq!(normed.len(), 2);
         assert!(rms_inv.is_finite());
         assert!(normed.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn gelu_matches_basic_shape_expectations() {
+        let values = gelu(&[-2.0, -0.5, 0.0, 0.5, 2.0]);
+        assert!(values.iter().all(|value| value.is_finite()));
+        assert!(values[0] < 0.0);
+        assert_eq!(values[2], 0.0);
+        assert!(values[3] > 0.0);
+        assert!(values[4] > values[3]);
+    }
+
+    #[test]
+    fn gelu_backward_is_finite() {
+        let grad = gelu_backward(&[-2.0, -0.5, 0.5, 2.0], &[1.0, 1.0, 1.0, 1.0]);
+        assert!(grad.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn silu_matches_basic_shape_expectations() {
+        let values = silu(&[-2.0, 0.0, 2.0]);
+        assert!(values[0] < 0.0);
+        assert_eq!(values[1], 0.0);
+        assert!(values[2] > 1.0);
+    }
+
+    #[test]
+    fn silu_backward_is_finite() {
+        let grad = silu_backward(&[-2.0, -0.5, 0.5, 2.0], &[1.0, 1.0, 1.0, 1.0]);
+        assert!(grad.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn swiglu_uses_silu_gate() {
+        let values = swiglu(&[1.0, -1.0], &[0.0, 1.0]).unwrap();
+        assert_eq!(values[0], 0.0);
+        assert!(values[1] < -0.7 && values[1] > -0.8);
+    }
+
+    #[test]
+    fn swiglu_backward_returns_finite_value_and_gate_grads() {
+        let (d_value, d_gate) = swiglu_backward(&[1.0, 2.0], &[0.5, -0.5], &[0.1, 0.2]).unwrap();
+        assert!(d_value.iter().all(|value| value.is_finite()));
+        assert!(d_gate.iter().all(|value| value.is_finite()));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use crate::core::rng::Rng;
 use crate::data::checkpoint::load_checkpoint;
 use crate::runtime::backend::ComputeBackend;
 use crate::runtime::profile::RuntimeProfile;
-use crate::runtime::sampling::generate_sample_with_backend;
+use crate::runtime::sampling::{SamplingStrategy, generate_sample_with_backend};
 use crate::runtime::training::{prepare_training_run, run_training_steps};
 
 #[derive(Debug)]
@@ -57,6 +57,14 @@ pub fn run_bench_sample(command: BenchSampleCommand) -> Result<()> {
     let backend = ComputeBackend::from_model(&checkpoint.model, command.sample.sample.device)?;
     let mut durations = Vec::with_capacity(command.bench.iterations);
     let aggregate_profile = RuntimeProfile::default();
+    let strategy = SamplingStrategy {
+        temperature: command.sample.sample.temperature,
+        top_k: command.sample.sample.top_k,
+        top_p: command.sample.sample.top_p,
+        repetition_penalty: command.sample.sample.repetition_penalty,
+        presence_penalty: command.sample.sample.presence_penalty,
+        frequency_penalty: command.sample.sample.frequency_penalty,
+    };
 
     for bench_idx in 0..(command.bench.warmup + command.bench.iterations) {
         let profile = RuntimeProfile::default();
@@ -68,7 +76,7 @@ pub fn run_bench_sample(command: BenchSampleCommand) -> Result<()> {
             &checkpoint.tokenizer,
             &command.sample.sample.prompt,
             command.sample.sample.max_new_tokens,
-            command.sample.sample.temperature,
+            &strategy,
             Some(&profile),
             &mut rng,
         )?;
@@ -100,8 +108,12 @@ fn bench_train_iterations(
 
     for bench_idx in 0..(bench.warmup + bench.iterations) {
         let profile = RuntimeProfile::default();
-        let mut prepared =
-            prepare_training_run(&command.data, &command.train, command.resume.as_deref())?;
+        let mut prepared = prepare_training_run(
+            &command.data,
+            &command.train,
+            command.validation_data.as_ref(),
+            command.resume.as_deref(),
+        )?;
         let mut backend = ComputeBackend::from_model(
             &prepared.model,
             device_override.unwrap_or(command.train.device),
@@ -117,6 +129,8 @@ fn bench_train_iterations(
             prepared.starting_step,
             Some(&profile),
             false,
+            prepared.validation_data.as_ref(),
+            None,
         )?;
         let elapsed = started_at.elapsed();
         if bench_idx >= bench.warmup {

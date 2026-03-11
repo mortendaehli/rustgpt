@@ -241,6 +241,8 @@ struct AdamParams {
     beta1: f32,
     beta2: f32,
     eps: f32,
+    weight_decay: f32,
+    _pad2: vec3<f32>,
 }
 
 @group(0) @binding(0)
@@ -276,6 +278,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let step = f32(params.step);
     let m_hat = m_new / (1.0 - pow(beta1, step));
     let v_hat = v_new / (1.0 - pow(beta2, step));
+    if (params.weight_decay > 0.0) {
+        weight[idx] = weight[idx] - params.lr * params.weight_decay * weight[idx];
+    }
     weight[idx] = weight[idx] - params.lr * m_hat / (sqrt(v_hat) + params.eps);
     grad[idx] = 0.0;
 }
@@ -491,6 +496,417 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     y[idx] = select(0.0, dout[idx], pre[idx] > 0.0);
+}
+"#;
+
+pub(super) const GELU_SHADER: &str = r#"
+struct Params {
+    len: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+@group(0) @binding(0)
+var<storage, read> x: array<f32>;
+
+@group(0) @binding(1)
+var<storage, read_write> y: array<f32>;
+
+@group(0) @binding(2)
+var<uniform> params: Params;
+
+fn gelu_approx(value: f32) -> f32 {
+    let cubic = value * value * value;
+    let inner = 0.7978846 * (value + 0.044715 * cubic);
+    return 0.5 * value * (1.0 + tanh(inner));
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.len) {
+        return;
+    }
+    y[idx] = gelu_approx(x[idx]);
+}
+"#;
+
+pub(super) const GELU_BACKWARD_SHADER: &str = r#"
+struct Params {
+    len: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+@group(0) @binding(0)
+var<storage, read> pre: array<f32>;
+
+@group(0) @binding(1)
+var<storage, read> dout: array<f32>;
+
+@group(0) @binding(2)
+var<storage, read_write> y: array<f32>;
+
+@group(0) @binding(3)
+var<uniform> params: Params;
+
+fn gelu_derivative(value: f32) -> f32 {
+    let cubic = value * value * value;
+    let inner = 0.7978846 * (value + 0.044715 * cubic);
+    let tanh_inner = tanh(inner);
+    let sech2 = 1.0 - tanh_inner * tanh_inner;
+    let inner_prime = 0.7978846 * (1.0 + 3.0 * 0.044715 * value * value);
+    return 0.5 * (1.0 + tanh_inner) + 0.5 * value * sech2 * inner_prime;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.len) {
+        return;
+    }
+    y[idx] = dout[idx] * gelu_derivative(pre[idx]);
+}
+"#;
+
+pub(super) const SILU_SHADER: &str = r#"
+struct Params {
+    len: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+@group(0) @binding(0)
+var<storage, read> x: array<f32>;
+
+@group(0) @binding(1)
+var<storage, read_write> y: array<f32>;
+
+@group(0) @binding(2)
+var<uniform> params: Params;
+
+fn silu(value: f32) -> f32 {
+    return value / (1.0 + exp(-value));
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.len) {
+        return;
+    }
+    y[idx] = silu(x[idx]);
+}
+"#;
+
+pub(super) const SILU_BACKWARD_SHADER: &str = r#"
+struct Params {
+    len: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+@group(0) @binding(0)
+var<storage, read> pre: array<f32>;
+
+@group(0) @binding(1)
+var<storage, read> dout: array<f32>;
+
+@group(0) @binding(2)
+var<storage, read_write> y: array<f32>;
+
+@group(0) @binding(3)
+var<uniform> params: Params;
+
+fn silu_derivative(value: f32) -> f32 {
+    let sigmoid = 1.0 / (1.0 + exp(-value));
+    return sigmoid * (1.0 + value * (1.0 - sigmoid));
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.len) {
+        return;
+    }
+    y[idx] = dout[idx] * silu_derivative(pre[idx]);
+}
+"#;
+
+pub(super) const MUL_SHADER: &str = r#"
+struct Params {
+    len: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+@group(0) @binding(0)
+var<storage, read> left: array<f32>;
+
+@group(0) @binding(1)
+var<storage, read> right: array<f32>;
+
+@group(0) @binding(2)
+var<storage, read_write> y: array<f32>;
+
+@group(0) @binding(3)
+var<uniform> params: Params;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.len) {
+        return;
+    }
+    y[idx] = left[idx] * right[idx];
+}
+"#;
+
+pub(super) const EXPAND_GQA_ROWS_SHADER: &str = r#"
+struct Params {
+    rows: u32,
+    n_head: u32,
+    n_kv_head: u32,
+    head_dim: u32,
+}
+
+@group(0) @binding(0)
+var<storage, read> x: array<f32>;
+
+@group(0) @binding(1)
+var<storage, read_write> y: array<f32>;
+
+@group(0) @binding(2)
+var<uniform> params: Params;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let expanded_cols = params.n_head * params.head_dim;
+    let total = params.rows * expanded_cols;
+    let idx = gid.x;
+    if (idx >= total) {
+        return;
+    }
+
+    let row = idx / expanded_cols;
+    let col = idx % expanded_cols;
+    let head = col / params.head_dim;
+    let feature = col % params.head_dim;
+    let query_heads_per_kv = params.n_head / params.n_kv_head;
+    let kv_head = head / query_heads_per_kv;
+    let compact_cols = params.n_kv_head * params.head_dim;
+    let src_idx = row * compact_cols + kv_head * params.head_dim + feature;
+    y[idx] = x[src_idx];
+}
+"#;
+
+pub(super) const COLLAPSE_GQA_ROWS_SHADER: &str = r#"
+struct Params {
+    rows: u32,
+    n_head: u32,
+    n_kv_head: u32,
+    head_dim: u32,
+}
+
+@group(0) @binding(0)
+var<storage, read> x: array<f32>;
+
+@group(0) @binding(1)
+var<storage, read_write> y: array<f32>;
+
+@group(0) @binding(2)
+var<uniform> params: Params;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let compact_cols = params.n_kv_head * params.head_dim;
+    let total = params.rows * compact_cols;
+    let idx = gid.x;
+    if (idx >= total) {
+        return;
+    }
+
+    let row = idx / compact_cols;
+    let col = idx % compact_cols;
+    let kv_head = col / params.head_dim;
+    let feature = col % params.head_dim;
+    let query_heads_per_kv = params.n_head / params.n_kv_head;
+    let expanded_cols = params.n_head * params.head_dim;
+
+    var acc = 0.0;
+    for (var offset = 0u; offset < query_heads_per_kv; offset = offset + 1u) {
+        let head = kv_head * query_heads_per_kv + offset;
+        let src_idx = row * expanded_cols + head * params.head_dim + feature;
+        acc = acc + x[src_idx];
+    }
+    y[idx] = acc;
+}
+"#;
+
+pub(super) const ROPE_SHADER: &str = r#"
+struct Params {
+    len: u32,
+    pos: u32,
+    head_dim: u32,
+    inverse: u32,
+}
+
+@group(0) @binding(0)
+var<storage, read> x: array<f32>;
+
+@group(0) @binding(1)
+var<storage, read_write> y: array<f32>;
+
+@group(0) @binding(2)
+var<uniform> params: Params;
+
+fn rope_value(current: f32, partner: f32, pair_idx: u32, half: u32, first_half: bool) -> f32 {
+    let theta = f32(params.pos) / pow(10000.0, f32(pair_idx) / f32(half));
+    let cos_theta = cos(theta);
+    let sin_theta = sin(theta);
+    if (params.inverse == 0u) {
+        if (first_half) {
+            return current * cos_theta - partner * sin_theta;
+        }
+        return current * cos_theta + partner * sin_theta;
+    }
+    if (first_half) {
+        return current * cos_theta + partner * sin_theta;
+    }
+    return current * cos_theta - partner * sin_theta;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.len) {
+        return;
+    }
+    let head_dim = params.head_dim;
+    let half = head_dim / 2u;
+    let local = idx % head_dim;
+    let first_half = local < half;
+    let pair_idx = select(local - half, local, first_half);
+    let base = idx - local;
+    let partner_idx = select(base + pair_idx, base + half + pair_idx, first_half);
+    y[idx] = rope_value(x[idx], x[partner_idx], pair_idx, half, first_half);
+}
+"#;
+
+pub(super) const ROPE_ROWS_SHADER: &str = r#"
+struct Params {
+    rows: u32,
+    cols: u32,
+    seq_len: u32,
+    head_dim: u32,
+}
+
+@group(0) @binding(0)
+var<storage, read> x: array<f32>;
+
+@group(0) @binding(1)
+var<storage, read_write> y: array<f32>;
+
+@group(0) @binding(2)
+var<uniform> params: Params;
+
+fn rope_value(current: f32, partner: f32, pos: u32, pair_idx: u32, half: u32) -> f32 {
+    let theta = f32(pos) / pow(10000.0, f32(pair_idx) / f32(half));
+    let cos_theta = cos(theta);
+    let sin_theta = sin(theta);
+    return current * cos_theta - partner * sin_theta;
+}
+
+fn rope_value_second(current: f32, partner: f32, pos: u32, pair_idx: u32, half: u32) -> f32 {
+    let theta = f32(pos) / pow(10000.0, f32(pair_idx) / f32(half));
+    let cos_theta = cos(theta);
+    let sin_theta = sin(theta);
+    return current * cos_theta + partner * sin_theta;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.rows * params.cols;
+    if (idx >= total) {
+        return;
+    }
+    let row = idx / params.cols;
+    let col = idx % params.cols;
+    let pos = row % params.seq_len;
+    let head_dim = params.head_dim;
+    let half = head_dim / 2u;
+    let local = col % head_dim;
+    let first_half = local < half;
+    let pair_idx = select(local - half, local, first_half);
+    let head_base = idx - local;
+    let partner_idx = select(head_base + pair_idx, head_base + half + pair_idx, first_half);
+    if (first_half) {
+        y[idx] = rope_value(x[idx], x[partner_idx], pos, pair_idx, half);
+    } else {
+        y[idx] = rope_value_second(x[idx], x[partner_idx], pos, pair_idx, half);
+    }
+}
+"#;
+
+pub(super) const ROPE_ROWS_BACKWARD_SHADER: &str = r#"
+struct Params {
+    rows: u32,
+    cols: u32,
+    seq_len: u32,
+    head_dim: u32,
+}
+
+@group(0) @binding(0)
+var<storage, read> x: array<f32>;
+
+@group(0) @binding(1)
+var<storage, read_write> y: array<f32>;
+
+@group(0) @binding(2)
+var<uniform> params: Params;
+
+fn rope_value(current: f32, partner: f32, pos: u32, pair_idx: u32, half: u32) -> f32 {
+    let theta = f32(pos) / pow(10000.0, f32(pair_idx) / f32(half));
+    let cos_theta = cos(theta);
+    let sin_theta = sin(theta);
+    return current * cos_theta + partner * sin_theta;
+}
+
+fn rope_value_second(current: f32, partner: f32, pos: u32, pair_idx: u32, half: u32) -> f32 {
+    let theta = f32(pos) / pow(10000.0, f32(pair_idx) / f32(half));
+    let cos_theta = cos(theta);
+    let sin_theta = sin(theta);
+    return current * cos_theta - partner * sin_theta;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = params.rows * params.cols;
+    if (idx >= total) {
+        return;
+    }
+    let row = idx / params.cols;
+    let col = idx % params.cols;
+    let pos = row % params.seq_len;
+    let head_dim = params.head_dim;
+    let half = head_dim / 2u;
+    let local = col % head_dim;
+    let first_half = local < half;
+    let pair_idx = select(local - half, local, first_half);
+    let head_base = idx - local;
+    let partner_idx = select(head_base + pair_idx, head_base + half + pair_idx, first_half);
+    if (first_half) {
+        y[idx] = rope_value(x[idx], x[partner_idx], pos, pair_idx, half);
+    } else {
+        y[idx] = rope_value_second(x[idx], x[partner_idx], pos, pair_idx, half);
+    }
 }
 "#;
 
@@ -1080,12 +1496,15 @@ var<storage, read> probs: array<f32>;
 var<storage, read> targets: array<u32>;
 
 @group(0) @binding(2)
-var<storage, read_write> d_logits: array<f32>;
+var<storage, read> loss_weights: array<f32>;
 
 @group(0) @binding(3)
-var<storage, read_write> losses: array<f32>;
+var<storage, read_write> d_logits: array<f32>;
 
 @group(0) @binding(4)
+var<storage, read_write> losses: array<f32>;
+
+@group(0) @binding(5)
 var<uniform> params: Params;
 
 @compute @workgroup_size(64)
@@ -1098,7 +1517,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let target_idx = targets[row];
     let row_base = row * params.cols;
     let target_prob = max(probs[row_base + target_idx], 1e-9);
-    losses[row] = -log(target_prob);
+    let weight = loss_weights[row];
+    losses[row] = -log(target_prob) * weight;
 
     for (var col = 0u; col < params.cols; col = col + 1u) {
         let idx = row_base + col;
@@ -1106,7 +1526,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (col == target_idx) {
             grad = grad - 1.0;
         }
-        d_logits[idx] = grad * params.norm;
+        d_logits[idx] = grad * params.norm * weight;
     }
 }
 "#;

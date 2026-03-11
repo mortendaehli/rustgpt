@@ -1,417 +1,357 @@
 # rustgpt
 
-Compact GPT-from-scratch implementation in pure Rust.
+RustGPT is a local decoder-only LLM stack in pure Rust.
 
-This repository contains:
+It is built for students who want to:
 
-- a small decoder-only byte-level GPT in `src/`
-- manual forward and backward passes
-- Adam training
-- checkpoint save/load
-- standalone sampling
-- a simple terminal chat REPL
-- small offline datasets in `data/`
+- train a tokenizer
+- pretrain a small base model
+- fine-tune it for chat with assistant-only SFT
+- evaluate it with checked prompt suites
+- use it from a terminal chat interface
 
-The current code is intentionally compact and CPU-friendly. It is suitable for learning, testing, and iterating on architecture ideas before adding larger-model features.
+This repo is not a wrapper around `llama.cpp`, `mlx`, or PyTorch. The model, training loop, sampling, checkpointing, and chat runtime all live in this codebase.
 
-The educational baseline is the CPU reference path. The GPU backend is included as an advanced systems layer, not as the first thing students should read.
+## Recommended Local Path
 
-## Status
+For a MacBook Pro M5 with 16 GB RAM, the most practical student workflow in this repo is:
 
-Working today:
+1. train a BPE tokenizer on `TinyStories`
+2. pretrain a compact base model on `TinyStories`
+3. resume training with `SmolTalk` chat data in `--mode sft`
+4. run `eval` with checked prompt suites
+5. launch the `chat` REPL against the SFT checkpoint
 
-- `cargo test`
-- `cargo run -- inspect-vocab ...`
-- `cargo run -- train ...`
-- `cargo run -- bench-train ...`
-- `cargo run -- sample ...`
-- `cargo run -- bench-sample ...`
-- `cargo run -- chat ...`
-- `cargo run -- gpu-info`
+The repo already includes downloaded open datasets for that exact path in `data/open/`.
 
-Current limitations:
+## Open Datasets Included
 
-- byte-level tokenizer only
-- grouped GPU batches currently require equal effective sequence length; mixed-length batches fall back to the reference per-sequence accumulation path
-- checkpoint version 2 uses the new byte tokenizer; legacy version 1 char-token checkpoints are not loaded
-- the chat REPL only makes sense with a checkpoint trained on chat-style text
-- the GPU path is intentionally educational rather than fully optimized
-- GPU training now uses full-sequence kernels for the main projection path, grouped equal-length GPU batches, and sequence-level GPU backward for attention/query accumulation
-- Metal through `wgpu` is measurably faster than CPU on the M5 for realistic training configs, but tiny configs still favor CPU and attention backward remains the dominant GPU cost
+See [data/open/README.md](/Users/mortendaehliaslesen/RustroverProjects/rustgpt/data/open/README.md) for the source URLs and file notes.
 
-## Read This First
+Included now:
 
-If you are teaching or learning from this repo, the recommended code-reading order is:
+- [data/open/tinystories/train-00000-of-00004.parquet](/Users/mortendaehliaslesen/RustroverProjects/rustgpt/data/open/tinystories/train-00000-of-00004.parquet)
+  - one official TinyStories training shard
+  - `237 MB`
+  - use for pretraining
+- [data/open/tinystories/validation.parquet](/Users/mortendaehliaslesen/RustroverProjects/rustgpt/data/open/tinystories/validation.parquet)
+  - official TinyStories validation split
+  - `9.5 MB`
+  - use for validation and smoke tests
+- [data/open/smoltalk-everyday/train.parquet](/Users/mortendaehliaslesen/RustroverProjects/rustgpt/data/open/smoltalk-everyday/train.parquet)
+  - `HuggingFaceTB/smoltalk` everyday-conversations subset
+  - `2260` chat records
+  - use for SFT
+- [data/open/smoltalk-everyday/test.parquet](/Users/mortendaehliaslesen/RustroverProjects/rustgpt/data/open/smoltalk-everyday/test.parquet)
+  - held-out chat split
+  - `119` chat records
+  - use for validation during SFT
 
-1. `src/data/tokenizer.rs`
-2. `src/model/mod.rs`
-3. `src/runtime/forward.rs`
-4. `src/runtime/backward.rs`
-5. `src/runtime/training.rs`
-6. `src/runtime/backend/` only after the CPU path makes sense
+Why this exact setup:
 
-## What This Project Teaches
-
-- how a tokenizer turns text into token IDs
-- how embeddings, attention, residual connections, and an MLP fit together in a decoder-only GPT
-- how to write explicit forward and backward passes in Rust without an autograd framework
-- how training data differs between line-based corpora and plain-text token streams
-- how checkpointing, sampling, and a simple chat REPL sit on top of the core model
-- how a portable GPU backend can accelerate the same model while staying structurally separate from the CPU reference path
-
-## Repo Layout
-
-```text
-.
-├── Cargo.toml
-├── Cargo.lock
-├── src/
-├── data/
-└── architecture.md
-```
-
-## Included Test Datasets
-
-The `data/` folder is intentionally small so the project is runnable offline and on modest hardware.
-
-- `data/names_demo.txt`
-  - line-delimited names
-  - best for the original name-generation workflow
-- `data/chat_tiny.txt`
-  - tiny transcript-style corpus using `System:`, `User:`, `Assistant:`
-  - best for testing the `chat` command end-to-end
-- `data/stories_tiny.txt`
-  - tiny plain-text story corpus
-  - useful for testing general text modeling with punctuation and whitespace
-
-For a larger next-step dataset that still fits a MacBook Pro M5 with 16 GB RAM comfortably, use `tinyshakespeare.txt` as a single plain-text file in `data/`. Plain-text corpora are now trained as sliding token windows across the whole byte stream instead of repeating the same prefix every step.
+- TinyStories is the first recommended pretraining dataset in [improvement-plan.md](/Users/mortendaehliaslesen/RustroverProjects/rustgpt/improvement-plan.md#L190)
+- SmolTalk is the current public dataset path that matches the small chat-SFT dataset direction in the same plan
+- one TinyStories shard is large enough to be real, but still reasonable for local iteration
+- the everyday-conversations SmolTalk subset is small enough that students can run end-to-end SFT locally
 
 ## Quick Start
 
-### 1. Run the test suite
+### 1. Run tests
 
 ```bash
 cargo test
 ```
 
-The repo keeps `checkpoints/` empty by default. All `.ckpt` files are local outputs that you generate yourself while following the examples below.
+### 2. Train a tokenizer
 
-### 2. Inspect a tokenizer
-
-```bash
-cargo run -- inspect-vocab --data data/names_demo.txt
-```
-
-### 3. Inspect GPU availability
-
-```bash
-cargo run -- gpu-info
-```
-
-The default device is `cpu` for classroom reproducibility. Use `--device cpu` in the main teaching flow so every student sees the same execution path. On macOS, `train`, `sample`, and `chat` use Metal through `wgpu` when you select `--device auto` or `--device gpu`. On systems without a compatible GPU adapter, `--device auto` falls back to CPU.
-
-### 3b. Profile a short training run
-
-```bash
-cargo run -- train \
-  --data data/names_demo.txt \
-  --steps 20 \
-  --device cpu \
-  --profile
-```
-
-This prints cumulative stage timings such as `sync.weights`, `forward.matvec`, `forward.attention`, `backward.matvec_t`, `backward.grad_accum`, `backward.row_grad`, and `optimizer.adam`. On a real GPU path you will also see device-resident stages such as `forward.add`, `forward.attention_scores`, `forward.attention_values`, `forward.readback`, `backward.attention`, and `sample.readback_logits`.
-
-### 4. Train a name model
+This is the first real step in the full workflow.
 
 ```bash
 mkdir -p checkpoints
 
-cargo run -- train \
-  --data data/names_demo.txt \
-  --steps 300 \
-  --sample-every 50 \
-  --device cpu \
-  --checkpoint-out checkpoints/names_demo.ckpt
+cargo run -- train-tokenizer \
+  --data data/open/tinystories/train-00000-of-00004.parquet \
+  --format parquet-text \
+  --out checkpoints/tinystories_bpe.json \
+  --vocab-size 4096 \
+  --min-frequency 2
 ```
 
-### 5. Sample from a saved checkpoint
+### 3. Pretrain a base model
 
-```bash
-cargo run -- sample \
-  --checkpoint checkpoints/names_demo.ckpt \
-  --device cpu \
-  --samples 5 \
-  --max-new-tokens 12 \
-  --seed 7
-```
-
-### 6. Resume training
+This is the recommended first local base-model recipe.
 
 ```bash
 cargo run -- train \
-  --data data/names_demo.txt \
-  --steps 200 \
-  --device cpu \
-  --resume checkpoints/names_demo.ckpt \
-  --checkpoint-out checkpoints/names_demo_v2.ckpt
-```
-
-## Chat Demo
-
-Train on the included transcript-style corpus:
-
-```bash
-mkdir -p checkpoints
-
-cargo run -- train \
-  --data data/chat_tiny.txt \
-  --format text \
-  --steps 500 \
-  --block-size 128 \
-  --n-embd 32 \
-  --n-head 4 \
-  --n-layer 1 \
-  --device cpu \
+  --data data/open/tinystories/train-00000-of-00004.parquet \
+  --format parquet-text \
+  --valid-data data/open/tinystories/validation.parquet \
+  --valid-format parquet-text \
+  --tokenizer checkpoints/tinystories_bpe.json \
+  --mode pretrain \
+  --steps 2000 \
+  --batch-size 8 \
   --sample-every 100 \
-  --checkpoint-out checkpoints/chat_tiny.ckpt
+  --block-size 128 \
+  --n-layer 4 \
+  --n-embd 128 \
+  --n-head 4 \
+  --n-kv-head 2 \
+  --activation swiglu \
+  --position rope \
+  --tied-embeddings \
+  --warmup-steps 100 \
+  --lr-schedule cosine \
+  --weight-decay 0.01 \
+  --grad-clip 1.0 \
+  --device auto \
+  --checkpoint-out checkpoints/tinystories_base.ckpt \
+  --best-checkpoint-out checkpoints/tinystories_base.best.ckpt
 ```
 
-Launch the REPL:
+Notes:
+
+- `--device auto` is the default recommendation on Apple Silicon.
+- use `--device cpu` in a classroom if you want every student on the same path.
+- keep `--block-size` the same for pretraining and SFT when you plan to resume from a checkpoint.
+
+### 4. Fine-tune the base model for chat
+
+Use the pretrained checkpoint and switch to `--mode sft` on the SmolTalk chat data.
+
+The simplest end-to-end path is to keep the default `simple` chat template:
+
+- `System: ...`
+- `User: ...`
+- `Assistant: ...`
+
+```bash
+cargo run -- train \
+  --data data/open/smoltalk-everyday/train.parquet \
+  --format parquet-chat \
+  --valid-data data/open/smoltalk-everyday/test.parquet \
+  --valid-format parquet-chat \
+  --chat-template simple \
+  --valid-chat-template simple \
+  --mode sft \
+  --steps 600 \
+  --batch-size 4 \
+  --sample-every 50 \
+  --device auto \
+  --resume checkpoints/tinystories_base.best.ckpt \
+  --checkpoint-out checkpoints/rustgpt_chat.ckpt \
+  --best-checkpoint-out checkpoints/rustgpt_chat.best.ckpt
+```
+
+Important:
+
+- when you resume from a checkpoint, RustGPT reuses that checkpoint's tokenizer and model config
+- for the first local workflow, keep the template simple and consistent across SFT, eval, and chat
+- SFT data uses assistant-only loss masking internally
+
+### 5. Evaluate the chat model
+
+Held-out loss on the chat split:
+
+```bash
+cargo run -- eval \
+  --checkpoint checkpoints/rustgpt_chat.best.ckpt \
+  --data data/open/smoltalk-everyday/test.parquet \
+  --format parquet-chat \
+  --chat-template simple \
+  --max-examples 64 \
+  --device auto
+```
+
+Checked prompt-suite evaluation for assistant turn termination and over-generation:
+
+```bash
+cargo run -- eval \
+  --checkpoint checkpoints/rustgpt_chat.best.ckpt \
+  --prompt-file evals/assistant_termination_simple.jsonl \
+  --temperature 1.0 \
+  --top-k 1 \
+  --device auto
+```
+
+The `eval` command will now:
+
+- load checked prompt cases from `--prompt-file`
+- print each prompt and output
+- mark each case as `pass` or `fail`
+- return a non-zero exit code if a checked case fails
+
+### 6. Launch the chat interface
 
 ```bash
 cargo run -- chat \
-  --checkpoint checkpoints/chat_tiny.ckpt \
-  --device cpu \
-  --system "be brief" \
-  --max-new-tokens 32 \
+  --checkpoint checkpoints/rustgpt_chat.best.ckpt \
+  --device auto \
+  --system "Be concise and helpful." \
+  --max-new-tokens 64 \
+  --stream \
   --seed 7
 ```
 
 REPL commands:
 
-- `/history`
-- `/reset`
 - `/exit`
+- `/reset`
+- `/history`
 
-Important:
+The REPL supports:
 
-- The REPL uses the checkpoint tokenizer.
-- A checkpoint trained only on names will not be useful for chat.
-- A chat checkpoint needs the transcript bytes and role prefixes in its training corpus.
-- The included chat corpus is only a plumbing demo. Expect rough outputs unless you train longer and on a better transcript dataset.
-- The REPL accepts multi-line UTF-8 input. Submit a message with an empty line.
+- multi-line UTF-8 input
+- token-budgeted history dropping
+- token-aware stop conditions
+- checkpointed chat-template metadata
 
-## Plain-Text Training Demo
+## Smoke-Test Workflow
 
-Train on a tiny story corpus:
+If you want a verified fast path before the larger student run, these exact commands were exercised locally in this repo.
+
+### 1. Tiny tokenizer on TinyStories validation
+
+```bash
+cargo run -- train-tokenizer \
+  --data data/open/tinystories/validation.parquet \
+  --format parquet-text \
+  --out /tmp/rustgpt_open_bpe.json \
+  --vocab-size 512 \
+  --min-frequency 2
+```
+
+### 2. Tiny pretrain checkpoint
 
 ```bash
 cargo run -- train \
-  --data data/stories_tiny.txt \
-  --format text \
-  --steps 800 \
-  --block-size 64 \
+  --data data/open/tinystories/validation.parquet \
+  --format parquet-text \
+  --valid-data data/open/tinystories/validation.parquet \
+  --valid-format parquet-text \
+  --tokenizer /tmp/rustgpt_open_bpe.json \
+  --steps 2 \
+  --batch-size 2 \
+  --block-size 32 \
+  --n-layer 1 \
   --n-embd 32 \
   --n-head 4 \
-  --n-layer 1 \
+  --n-kv-head 2 \
+  --activation swiglu \
+  --position rope \
+  --tied-embeddings \
   --device cpu \
-  --checkpoint-out checkpoints/stories_tiny.ckpt
+  --checkpoint-out /tmp/rustgpt_open_pretrain.ckpt
 ```
 
-Sample with a prompt:
-
-```bash
-cargo run -- sample \
-  --checkpoint checkpoints/stories_tiny.ckpt \
-  --device cpu \
-  --prompt "The lighthouse" \
-  --samples 3 \
-  --max-new-tokens 48 \
-  --temperature 0.7
-```
-
-## Benchmarking
-
-Use the built-in benchmark commands when comparing CPU vs GPU changes or before starting a new runtime refactor.
-
-For hardware comparisons, use release mode:
-
-```bash
-cargo run --release -- bench-compare-train \
-  --data data/tinyshakespeare.txt \
-  --format text \
-  --steps 1 \
-  --block-size 128 \
-  --n-embd 256 \
-  --n-head 8 \
-  --n-layer 2 \
-  --iters 3 \
-  --warmup 1
-```
-
-`bench-compare-train` forces one CPU run and one GPU run with the same model and dataset settings, then prints the average wall-clock time and `speedup_vs_cpu`.
-
-You should re-run the benchmark after any backend or tokenizer change. Earlier benchmark snapshots from this repo are no longer authoritative because the training path now uses sliding windows for plain-text corpora and a byte-level tokenizer.
-
-`--batch-size` now has two behaviors:
-
-- on CPU, it is still gradient accumulation
-- on GPU, it uses one grouped equal-length batch path when every sequence in the batch has the same effective training length; otherwise it falls back to the reference per-sequence accumulation path
-
-For teaching, keep the main exercises on CPU first and only switch to `--device auto` or `--device gpu` after students understand the reference path.
-
-For the current codebase, `--format text` is the easiest way to exercise the grouped GPU path because every optimizer step sees the same truncated sequence length.
-
-Benchmark repeated training runs:
-
-```bash
-cargo run -- bench-train \
-  --data data/tinyshakespeare.txt \
-  --format text \
-  --steps 50 \
-  --block-size 64 \
-  --n-embd 32 \
-  --n-head 4 \
-  --n-layer 1 \
-  --device auto \
-  --iters 5 \
-  --warmup 1
-```
-
-Benchmark repeated sampling runs:
-
-```bash
-cargo run -- bench-sample \
-  --checkpoint checkpoints/shakespeare.ckpt \
-  --device auto \
-  --prompt "ROMEO:" \
-  --max-new-tokens 64 \
-  --iters 10 \
-  --warmup 2
-```
-
-Both benchmark commands print an aggregate wall-clock summary plus cumulative runtime stage timings.
-
-Important:
-
-- Benchmark training in `--release`, not debug mode.
-- `--device auto` is useful for normal workflows, but `bench-compare-train` is the honest way to compare CPU and GPU on the same machine.
-- The current GPU training backend is educational and improving quickly, but it still pays a measurable cost in `backward.attention`, and grouped-batch scaling is not linear yet.
-
-## Recommended MacBook Dataset
-
-For a more meaningful text run on a MacBook Pro M5 with 16 GB RAM, use `tinyshakespeare.txt`.
-
-Suggested command:
+### 3. Tiny chat SFT resume
 
 ```bash
 cargo run -- train \
-  --data data/tinyshakespeare.txt \
-  --format text \
-  --steps 2000 \
-  --block-size 64 \
-  --n-embd 32 \
-  --n-head 4 \
-  --n-layer 1 \
+  --data data/open/smoltalk-everyday/train.parquet \
+  --format parquet-chat \
+  --valid-data data/open/smoltalk-everyday/test.parquet \
+  --valid-format parquet-chat \
+  --chat-template simple \
+  --valid-chat-template simple \
+  --mode sft \
+  --steps 2 \
+  --batch-size 1 \
+  --sample-every 1 \
   --device cpu \
-  --sample-every 200 \
-  --checkpoint-out checkpoints/shakespeare.ckpt
+  --resume /tmp/rustgpt_open_pretrain.ckpt \
+  --checkpoint-out /tmp/rustgpt_open_chat.ckpt
 ```
 
-Why this is a good fit:
-
-- small enough for fast CPU iteration
-- large enough to show real language structure
-- better signal than a tiny demo corpus
-- still aligned with the current byte-level implementation
-
-I would avoid jumping to large modern corpora until batching, longer-context handling, and better tokenization are implemented.
-
-## Command Summary
-
-### Train
+### 4. Tiny checked eval
 
 ```bash
-cargo run -- train --data <PATH> [options]
+cargo run -- eval \
+  --checkpoint /tmp/rustgpt_open_chat.ckpt \
+  --prompt-file evals/assistant_termination_simple.jsonl \
+  --temperature 1.0 \
+  --top-k 1 \
+  --device cpu
 ```
 
-Useful options:
-
-- `--format lines|text`
-- `--steps <N>`
-- `--batch-size <N>`
-- `--block-size <N>`
-- `--n-layer <N>`
-- `--n-embd <N>`
-- `--n-head <N>`
-- `--lr <F32>`
-- `--beta1 <F32>`
-- `--beta2 <F32>`
-- `--eps <F32>`
-- `--seed <N>`
-- `--sample-every <N>`
-- `--device cpu|auto|gpu`
-- `--profile`
-- `--separate-eos`
-- `--checkpoint-out <PATH>`
-- `--resume <PATH>`
-
-### Sample
+### 5. Tiny chat REPL
 
 ```bash
-cargo run -- sample --checkpoint <PATH> [options]
+cargo run -- chat \
+  --checkpoint /tmp/rustgpt_open_chat.ckpt \
+  --device cpu \
+  --system "be brief" \
+  --max-new-tokens 8 \
+  --stream \
+  --seed 7
 ```
 
-Useful options:
+## Data Formats
 
-- `--prompt <TEXT>`
-- `--temperature <F32>`
-- `--max-new-tokens <N>`
-- `--samples <N>`
-- `--seed <N>`
-- `--device cpu|auto|gpu`
-- `--profile`
+RustGPT trains directly from:
 
-### Chat
+- `text`
+- `lines`
+- `jsonl-text`
+- `jsonl-chat`
+- `parquet-text`
+- `parquet-chat`
+
+Structured chat records use:
+
+```json
+{"messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}]}
+```
+
+Supported roles are:
+
+- `system`
+- `user`
+- `assistant`
+- `tool`
+
+If students want to inspect or normalize datasets before training, use `prepare-data`.
+
+Example:
 
 ```bash
-cargo run -- chat --checkpoint <PATH> [options]
+cargo run -- prepare-data \
+  --data data/open/smoltalk-everyday/train.parquet \
+  --format parquet-chat \
+  --out /tmp/smoltalk_everyday_train.jsonl \
+  --out-format jsonl-chat
 ```
 
-Useful options:
+## Recommended Model Sizes
 
-- `--system <TEXT>`
-- `--temperature <F32>`
-- `--max-new-tokens <N>`
-- `--seed <N>`
-- `--device cpu|auto|gpu`
+Good starting points on a 16 GB Apple laptop:
 
-### GPU Info
+- fast smoke runs: `1 layer`, `32 embd`, `block size 32`
+- first real pretrain/SFT run: `4 layers`, `128 embd`, `block size 128`
+- more ambitious local experiments: increase `steps` before increasing model width
 
-```bash
-cargo run -- gpu-info [--device cpu|auto|gpu]
-```
+Keep expectations realistic:
 
-This reports the adapter `wgpu` would use for compute. In sandboxed or headless environments it may report that no compatible GPU adapter is available, in which case `train`, `sample`, and `chat` will use CPU when run with `--device auto`.
+- this repo can demonstrate real local pretraining and chat SFT
+- it will not match current production small-model quality from scratch on one laptop
+- progress should be measured with held-out loss and checked prompt suites, not just by reading one lucky sample
 
-### Bench-Train
+## Useful Commands
 
-```bash
-cargo run -- bench-train --data <PATH> [train options] [--iters <N>] [--warmup <N>]
-```
+- `cargo test`
+- `cargo run -- inspect-vocab --data <PATH> --format <MODE>`
+- `cargo run -- gpu-info`
+- `cargo run -- prepare-data ...`
+- `cargo run -- train-tokenizer ...`
+- `cargo run -- train ...`
+- `cargo run -- eval ...`
+- `cargo run -- chat ...`
 
-### Bench-Sample
+## Repo Layout
 
-```bash
-cargo run -- bench-sample --checkpoint <PATH> [sample options] [--iters <N>] [--warmup <N>]
-```
-
-## Engineering Notes
-
-- The Rust baseline follows the verified behavior of the local `gpt.py` before optional architectural changes.
-- See `architecture.md` for the expansion path toward larger architectures and research tooling.
-- GPU compute is intentionally educational: `src/gpu.rs` uses explicit WGSL kernels instead of hiding the math behind a large framework.
-- Training uses the same backend abstraction as inference.
-- The current GPU scope keeps parameter buffers, parameter gradients, and optimizer state on device for GPU training.
-- Dense matrix-vector work, linear gradient accumulation, embedding row-gradient accumulation, and GPU-training Adam run on device, while attention score loops, norm/relu backward helpers, softmax backward, and training attention flow still remain on CPU.
+- `src/data/` for corpora, schema, tokenizer, checkpointing, and data prep
+- `src/model/` for transformer parameters and architecture helpers
+- `src/runtime/` for forward, backward, training, sampling, eval, and backend code
+- `evals/` for checked prompt suites
+- `data/open/` for the downloaded open datasets used in the recommended workflow
+- [improvement-plan.md](/Users/mortendaehliaslesen/RustroverProjects/rustgpt/improvement-plan.md) for the longer roadmap

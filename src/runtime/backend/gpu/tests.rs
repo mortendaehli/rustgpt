@@ -1,9 +1,12 @@
-use crate::core::config::{BoundaryMode, DeviceKind, ModelConfig};
+use crate::core::config::{
+    ActivationKind, BoundaryMode, DeviceKind, ModelConfig, PositionEncodingKind,
+};
 use crate::core::rng::Rng;
 use crate::core::tensor::{
     Matrix, accumulate_linear_grad, add_in_place, linear, linear_transposed,
 };
 use crate::data::tokenizer::Tokenizer;
+use crate::data::training_data::SequenceExample;
 use crate::runtime::forward::forward_token;
 use crate::runtime::workspace::new_kv_cache;
 
@@ -28,6 +31,10 @@ fn auto_backend_falls_back_to_cpu_or_uses_gpu() {
         n_layer: 1,
         n_embd: 16,
         n_head: 4,
+        n_kv_head: 4,
+        tie_embeddings: false,
+        activation: ActivationKind::Relu,
+        position_encoding: PositionEncodingKind::LearnedAbsolute,
         boundary_mode: BoundaryMode::SharedBos,
     };
     let mut rng = Rng::from_seed(42);
@@ -61,6 +68,10 @@ fn gpu_matvec_matches_cpu_when_adapter_is_available() {
         n_layer: 1,
         n_embd: 16,
         n_head: 4,
+        n_kv_head: 4,
+        tie_embeddings: false,
+        activation: ActivationKind::Relu,
+        position_encoding: PositionEncodingKind::LearnedAbsolute,
         boundary_mode: BoundaryMode::SharedBos,
     };
     let mut rng = Rng::from_seed(42);
@@ -87,6 +98,10 @@ fn gpu_transposed_matvec_matches_cpu_when_adapter_is_available() {
         n_layer: 1,
         n_embd: 16,
         n_head: 4,
+        n_kv_head: 4,
+        tie_embeddings: false,
+        activation: ActivationKind::Relu,
+        position_encoding: PositionEncodingKind::LearnedAbsolute,
         boundary_mode: BoundaryMode::SharedBos,
     };
     let mut rng = Rng::from_seed(42);
@@ -115,6 +130,10 @@ fn gpu_backend_syncs_updated_weights_when_adapter_is_available() {
         n_layer: 1,
         n_embd: 16,
         n_head: 4,
+        n_kv_head: 4,
+        tie_embeddings: false,
+        activation: ActivationKind::Relu,
+        position_encoding: PositionEncodingKind::LearnedAbsolute,
         boundary_mode: BoundaryMode::SharedBos,
     };
     let mut rng = Rng::from_seed(42);
@@ -141,6 +160,10 @@ fn gpu_outer_product_grad_accum_matches_cpu_when_adapter_is_available() {
         n_layer: 1,
         n_embd: 16,
         n_head: 4,
+        n_kv_head: 4,
+        tie_embeddings: false,
+        activation: ActivationKind::Relu,
+        position_encoding: PositionEncodingKind::LearnedAbsolute,
         boundary_mode: BoundaryMode::SharedBos,
     };
     let mut rng = Rng::from_seed(42);
@@ -172,6 +195,10 @@ fn gpu_row_grad_accum_matches_cpu_when_adapter_is_available() {
         n_layer: 1,
         n_embd: 16,
         n_head: 4,
+        n_kv_head: 4,
+        tie_embeddings: false,
+        activation: ActivationKind::Relu,
+        position_encoding: PositionEncodingKind::LearnedAbsolute,
         boundary_mode: BoundaryMode::SharedBos,
     };
     let mut rng = Rng::from_seed(42);
@@ -203,6 +230,214 @@ fn gpu_device_resident_forward_matches_cpu_when_adapter_is_available() {
         n_layer: 1,
         n_embd: 16,
         n_head: 4,
+        n_kv_head: 4,
+        tie_embeddings: false,
+        activation: ActivationKind::Relu,
+        position_encoding: PositionEncodingKind::LearnedAbsolute,
+        boundary_mode: BoundaryMode::SharedBos,
+    };
+    let mut rng = Rng::from_seed(42);
+    let model = crate::model::Model::new(cfg, &mut rng).unwrap();
+    let Ok(backend) = ComputeBackend::from_model(&model, DeviceKind::Gpu) else {
+        return;
+    };
+
+    let tokens = tokenizer.encode_with_boundaries("em").unwrap();
+    let mut cpu_kv_cache = new_kv_cache(model.cfg.n_layer, model.cfg.n_embd);
+    let cpu = forward_token(&model, tokens[0], tokens[1], 0, &mut cpu_kv_cache)
+        .unwrap()
+        .logits;
+
+    let Some((runtime, matrices)) = backend.raw_gpu_state() else {
+        panic!("expected gpu backend");
+    };
+    let mut gpu_layer_caches = (0..model.cfg.n_layer)
+        .map(|layer_idx| runtime.create_kv_cache(model.cfg.block_size, model.cfg.n_embd, layer_idx))
+        .collect::<crate::core::error::Result<Vec<_>>>()
+        .unwrap();
+    let gpu = run_gpu_forward_token(
+        runtime,
+        matrices,
+        &model,
+        &mut gpu_layer_caches,
+        tokens[0],
+        0,
+        None,
+    )
+    .unwrap();
+
+    for (left, right) in cpu.iter().zip(&gpu) {
+        assert!((left - right).abs() < 1e-4);
+    }
+}
+
+#[test]
+fn gpu_device_resident_forward_supports_gelu_when_adapter_is_available() {
+    let docs = vec!["emma".to_string()];
+    let tokenizer = Tokenizer::from_docs(&docs, BoundaryMode::SharedBos).unwrap();
+    let cfg = ModelConfig {
+        vocab_size: tokenizer.vocab_size(),
+        block_size: 16,
+        n_layer: 1,
+        n_embd: 16,
+        n_head: 4,
+        n_kv_head: 4,
+        tie_embeddings: false,
+        activation: ActivationKind::Gelu,
+        position_encoding: PositionEncodingKind::LearnedAbsolute,
+        boundary_mode: BoundaryMode::SharedBos,
+    };
+    let mut rng = Rng::from_seed(42);
+    let model = crate::model::Model::new(cfg, &mut rng).unwrap();
+    let Ok(backend) = ComputeBackend::from_model(&model, DeviceKind::Gpu) else {
+        return;
+    };
+
+    let tokens = tokenizer.encode_with_boundaries("em").unwrap();
+    let mut cpu_kv_cache = new_kv_cache(model.cfg.n_layer, model.cfg.n_embd);
+    let cpu = forward_token(&model, tokens[0], tokens[1], 0, &mut cpu_kv_cache)
+        .unwrap()
+        .logits;
+
+    let Some((runtime, matrices)) = backend.raw_gpu_state() else {
+        panic!("expected gpu backend");
+    };
+    let mut gpu_layer_caches = (0..model.cfg.n_layer)
+        .map(|layer_idx| runtime.create_kv_cache(model.cfg.block_size, model.cfg.n_embd, layer_idx))
+        .collect::<crate::core::error::Result<Vec<_>>>()
+        .unwrap();
+    let gpu = run_gpu_forward_token(
+        runtime,
+        matrices,
+        &model,
+        &mut gpu_layer_caches,
+        tokens[0],
+        0,
+        None,
+    )
+    .unwrap();
+
+    for (left, right) in cpu.iter().zip(&gpu) {
+        assert!((left - right).abs() < 1e-4);
+    }
+}
+
+#[test]
+fn gpu_device_resident_forward_supports_rope_when_adapter_is_available() {
+    let docs = vec!["emma".to_string()];
+    let tokenizer = Tokenizer::from_docs(&docs, BoundaryMode::SharedBos).unwrap();
+    let cfg = ModelConfig {
+        vocab_size: tokenizer.vocab_size(),
+        block_size: 16,
+        n_layer: 1,
+        n_embd: 16,
+        n_head: 4,
+        n_kv_head: 4,
+        tie_embeddings: false,
+        activation: ActivationKind::Relu,
+        position_encoding: PositionEncodingKind::Rope,
+        boundary_mode: BoundaryMode::SharedBos,
+    };
+    let mut rng = Rng::from_seed(42);
+    let model = crate::model::Model::new(cfg, &mut rng).unwrap();
+    let Ok(backend) = ComputeBackend::from_model(&model, DeviceKind::Gpu) else {
+        return;
+    };
+
+    let tokens = tokenizer.encode_with_boundaries("em").unwrap();
+    let mut cpu_kv_cache = new_kv_cache(model.cfg.n_layer, model.cfg.n_embd);
+    let cpu = forward_token(&model, tokens[0], tokens[1], 0, &mut cpu_kv_cache)
+        .unwrap()
+        .logits;
+
+    let Some((runtime, matrices)) = backend.raw_gpu_state() else {
+        panic!("expected gpu backend");
+    };
+    let mut gpu_layer_caches = (0..model.cfg.n_layer)
+        .map(|layer_idx| runtime.create_kv_cache(model.cfg.block_size, model.cfg.n_embd, layer_idx))
+        .collect::<crate::core::error::Result<Vec<_>>>()
+        .unwrap();
+    let gpu = run_gpu_forward_token(
+        runtime,
+        matrices,
+        &model,
+        &mut gpu_layer_caches,
+        tokens[0],
+        0,
+        None,
+    )
+    .unwrap();
+
+    for (left, right) in cpu.iter().zip(&gpu) {
+        assert!((left - right).abs() < 1e-4);
+    }
+}
+
+#[test]
+fn gpu_device_resident_forward_supports_swiglu_when_adapter_is_available() {
+    let docs = vec!["emma".to_string()];
+    let tokenizer = Tokenizer::from_docs(&docs, BoundaryMode::SharedBos).unwrap();
+    let cfg = ModelConfig {
+        vocab_size: tokenizer.vocab_size(),
+        block_size: 16,
+        n_layer: 1,
+        n_embd: 16,
+        n_head: 4,
+        n_kv_head: 4,
+        tie_embeddings: false,
+        activation: ActivationKind::SwiGlu,
+        position_encoding: PositionEncodingKind::LearnedAbsolute,
+        boundary_mode: BoundaryMode::SharedBos,
+    };
+    let mut rng = Rng::from_seed(42);
+    let model = crate::model::Model::new(cfg, &mut rng).unwrap();
+    let Ok(backend) = ComputeBackend::from_model(&model, DeviceKind::Gpu) else {
+        return;
+    };
+
+    let tokens = tokenizer.encode_with_boundaries("em").unwrap();
+    let mut cpu_kv_cache = new_kv_cache(model.cfg.n_layer, model.cfg.n_embd);
+    let cpu = forward_token(&model, tokens[0], tokens[1], 0, &mut cpu_kv_cache)
+        .unwrap()
+        .logits;
+
+    let Some((runtime, matrices)) = backend.raw_gpu_state() else {
+        panic!("expected gpu backend");
+    };
+    let mut gpu_layer_caches = (0..model.cfg.n_layer)
+        .map(|layer_idx| runtime.create_kv_cache(model.cfg.block_size, model.cfg.n_embd, layer_idx))
+        .collect::<crate::core::error::Result<Vec<_>>>()
+        .unwrap();
+    let gpu = run_gpu_forward_token(
+        runtime,
+        matrices,
+        &model,
+        &mut gpu_layer_caches,
+        tokens[0],
+        0,
+        None,
+    )
+    .unwrap();
+
+    for (left, right) in cpu.iter().zip(&gpu) {
+        assert!((left - right).abs() < 1e-4);
+    }
+}
+
+#[test]
+fn gpu_device_resident_forward_supports_grouped_query_attention_when_adapter_is_available() {
+    let docs = vec!["emma".to_string()];
+    let tokenizer = Tokenizer::from_docs(&docs, BoundaryMode::SharedBos).unwrap();
+    let cfg = ModelConfig {
+        vocab_size: tokenizer.vocab_size(),
+        block_size: 16,
+        n_layer: 1,
+        n_embd: 16,
+        n_head: 4,
+        n_kv_head: 2,
+        tie_embeddings: false,
+        activation: ActivationKind::Relu,
+        position_encoding: PositionEncodingKind::Rope,
         boundary_mode: BoundaryMode::SharedBos,
     };
     let mut rng = Rng::from_seed(42);
@@ -248,12 +483,38 @@ fn shared_batch_seq_len_requires_matching_effective_lengths() {
         n_layer: 1,
         n_embd: 8,
         n_head: 2,
+        n_kv_head: 2,
+        tie_embeddings: false,
+        activation: ActivationKind::Relu,
+        position_encoding: PositionEncodingKind::LearnedAbsolute,
         boundary_mode: BoundaryMode::SharedBos,
     };
     let mut rng = Rng::from_seed(7);
     let model = crate::model::Model::new(cfg, &mut rng).unwrap();
-    let matching = vec![vec![0, 1, 2, 3], vec![0, 4, 5, 6]];
-    let mismatched = vec![vec![0, 1, 2, 3], vec![0, 4, 5]];
+    let matching = vec![
+        SequenceExample {
+            input_ids: vec![0, 1, 2],
+            target_ids: vec![1, 2, 3],
+            loss_mask: vec![1.0; 3],
+        },
+        SequenceExample {
+            input_ids: vec![0, 4, 5],
+            target_ids: vec![4, 5, 6],
+            loss_mask: vec![1.0; 3],
+        },
+    ];
+    let mismatched = vec![
+        SequenceExample {
+            input_ids: vec![0, 1, 2],
+            target_ids: vec![1, 2, 3],
+            loss_mask: vec![1.0; 3],
+        },
+        SequenceExample {
+            input_ids: vec![0, 4],
+            target_ids: vec![4, 5],
+            loss_mask: vec![1.0; 2],
+        },
+    ];
 
     assert_eq!(shared_batch_seq_len(&model, &matching).unwrap(), Some(3));
     assert_eq!(shared_batch_seq_len(&model, &mismatched).unwrap(), None);

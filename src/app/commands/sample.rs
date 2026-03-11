@@ -4,7 +4,7 @@ use crate::core::rng::Rng;
 use crate::data::checkpoint::load_checkpoint;
 use crate::runtime::backend::ComputeBackend;
 use crate::runtime::profile::RuntimeProfile;
-use crate::runtime::sampling::generate_sample_with_backend;
+use crate::runtime::sampling::{SamplingStrategy, generate_sample_with_backend};
 
 pub fn run_sample(command: SampleCommand) -> Result<()> {
     let checkpoint = load_checkpoint(&command.checkpoint)?;
@@ -13,18 +13,29 @@ pub fn run_sample(command: SampleCommand) -> Result<()> {
     let runtime_profile = command.sample.profile.then(RuntimeProfile::default);
 
     println!(
-        "RustGPT sample  checkpoint={}  vocab={}  params={}  seed={}  temperature={}  backend={}",
+        "RustGPT sample  checkpoint={}  vocab={}  params={}  seed={}  temperature={}  top_k={}  top_p={}  backend={}",
         command.checkpoint.display(),
         checkpoint.tokenizer.vocab_size(),
         checkpoint.model.num_parameters(),
         command.sample.seed,
         command.sample.temperature,
+        command.sample.top_k,
+        command.sample.top_p,
         backend.description()
     );
     println!(
         "trained_steps={}  max_new_tokens={}  samples={}",
         checkpoint.trained_steps, command.sample.max_new_tokens, command.sample.samples
     );
+
+    let strategy = SamplingStrategy {
+        temperature: command.sample.temperature,
+        top_k: command.sample.top_k,
+        top_p: command.sample.top_p,
+        repetition_penalty: command.sample.repetition_penalty,
+        presence_penalty: command.sample.presence_penalty,
+        frequency_penalty: command.sample.frequency_penalty,
+    };
 
     for sample_idx in 0..command.sample.samples {
         let sample = generate_sample_with_backend(
@@ -33,7 +44,7 @@ pub fn run_sample(command: SampleCommand) -> Result<()> {
             &checkpoint.tokenizer,
             &command.sample.prompt,
             command.sample.max_new_tokens,
-            command.sample.temperature,
+            &strategy,
             runtime_profile.as_ref(),
             &mut rng,
         )?;

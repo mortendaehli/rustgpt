@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 
+use crate::core::config::{ActivationKind, PositionEncodingKind};
 use crate::core::error::{Result, RustGptError};
 use crate::core::rng::Rng;
-use crate::data::tokenizer::{TokenSymbol, Tokenizer};
+use crate::data::tokenizer::Tokenizer;
 use crate::model::{Model, ParameterId};
 use crate::runtime::profile::{RuntimeProfile, measure};
+use crate::runtime::sampling::{SamplingStrategy, StopCondition, select_next_token};
 
 use super::{GpuLayerCache, GpuMatrix, GpuRuntime, lookup_parameter};
 
@@ -38,16 +40,21 @@ pub(super) fn run_gpu_forward_token(
     }
 
     let wte = lookup_parameter(matrices, ParameterId::Wte)?;
-    let wpe = lookup_parameter(matrices, ParameterId::Wpe)?;
     let token_embed = measure(profile, "forward.gather", || {
         runtime.gather_row(wte, token_id)
     })?;
-    let pos_embed = measure(profile, "forward.gather", || {
-        runtime.gather_row(wpe, pos_id)
-    })?;
-    let embed_sum = measure(profile, "forward.add", || {
-        runtime.add(&token_embed, &pos_embed)
-    })?;
+    let embed_sum = match model.cfg.position_encoding {
+        PositionEncodingKind::LearnedAbsolute => {
+            let wpe = lookup_parameter(matrices, ParameterId::Wpe)?;
+            let pos_embed = measure(profile, "forward.gather", || {
+                runtime.gather_row(wpe, pos_id)
+            })?;
+            measure(profile, "forward.add", || {
+                runtime.add(&token_embed, &pos_embed)
+            })?
+        }
+        PositionEncodingKind::Rope => token_embed,
+    };
     let mut x = measure(profile, "forward.rmsnorm", || runtime.rmsnorm(&embed_sum))?;
 
     for layer_idx in 0..model.cfg.n_layer {
@@ -65,11 +72,41 @@ pub(super) fn run_gpu_forward_token(
         let q = measure(profile, "forward.matvec", || {
             runtime.matvec_vector(&x_norm_attn, attn_wq)
         })?;
-        let k = measure(profile, "forward.matvec", || {
+        let k_compact = measure(profile, "forward.matvec", || {
             runtime.matvec_vector(&x_norm_attn, attn_wk)
         })?;
-        let v = measure(profile, "forward.matvec", || {
+        let q = match model.cfg.position_encoding {
+            PositionEncodingKind::LearnedAbsolute => q,
+            PositionEncodingKind::Rope => measure(profile, "forward.position", || {
+                runtime.rope(&q, pos_id, model.head_dim())
+            })?,
+        };
+        let k_compact = match model.cfg.position_encoding {
+            PositionEncodingKind::LearnedAbsolute => k_compact,
+            PositionEncodingKind::Rope => measure(profile, "forward.position", || {
+                runtime.rope(&k_compact, pos_id, model.head_dim())
+            })?,
+        };
+        let v_compact = measure(profile, "forward.matvec", || {
             runtime.matvec_vector(&x_norm_attn, attn_wv)
+        })?;
+        let k = measure(profile, "forward.attention_expand", || {
+            runtime.expand_grouped_heads_rows(
+                &k_compact,
+                1,
+                model.cfg.n_head,
+                model.cfg.n_kv_head,
+                model.head_dim(),
+            )
+        })?;
+        let v = measure(profile, "forward.attention_expand", || {
+            runtime.expand_grouped_heads_rows(
+                &v_compact,
+                1,
+                model.cfg.n_head,
+                model.cfg.n_kv_head,
+                model.head_dim(),
+            )
         })?;
 
         let cache = &mut layer_caches[layer_idx];
@@ -112,7 +149,28 @@ pub(super) fn run_gpu_forward_token(
         let hidden_pre = measure(profile, "forward.matvec", || {
             runtime.matvec_vector(&x_norm_mlp, mlp_fc1)
         })?;
-        let hidden_act = measure(profile, "forward.relu", || runtime.relu(&hidden_pre))?;
+        let gate_pre = if model.cfg.activation == ActivationKind::SwiGlu {
+            let mlp_fc_gate = lookup_parameter(matrices, ParameterId::MlpFcGate(layer_idx))?;
+            Some(measure(profile, "forward.matvec", || {
+                runtime.matvec_vector(&x_norm_mlp, mlp_fc_gate)
+            })?)
+        } else {
+            None
+        };
+        let hidden_act = measure(profile, "forward.activation", || {
+            match model.cfg.activation {
+                ActivationKind::Relu => runtime.relu(&hidden_pre),
+                ActivationKind::Gelu => runtime.gelu(&hidden_pre),
+                ActivationKind::SwiGlu => {
+                    let gate_act = runtime.silu(
+                        gate_pre
+                            .as_ref()
+                            .expect("swiglu activation requires gate pre-activations"),
+                    )?;
+                    runtime.mul(&hidden_pre, &gate_act)
+                }
+            }
+        })?;
         let mlp_out = measure(profile, "forward.matvec", || {
             runtime.matvec_vector(&hidden_act, mlp_fc2)
         })?;
@@ -121,7 +179,8 @@ pub(super) fn run_gpu_forward_token(
         })?;
     }
 
-    let lm_head = lookup_parameter(matrices, ParameterId::LmHead)?;
+    let x = measure(profile, "forward.rmsnorm", || runtime.rmsnorm(&x))?;
+    let lm_head = lookup_parameter(matrices, model.output_parameter_id())?;
     let logits = measure(profile, "forward.matvec", || {
         runtime.matvec_vector(&x, lm_head)
     })?;
@@ -137,23 +196,79 @@ pub(super) fn run_gpu_completion(
     tokenizer: &Tokenizer,
     prompt: &str,
     max_new_tokens: usize,
-    temperature: f32,
-    stop_sequences: &[&str],
+    strategy: &SamplingStrategy,
+    stop_condition: &StopCondition,
     rng: &mut Rng,
     profile: Option<&RuntimeProfile>,
 ) -> Result<String> {
-    if temperature <= 0.0 {
-        return Err(RustGptError::Config("temperature must be > 0".to_string()));
-    }
+    strategy.validate()?;
 
-    let mut conditioning = Vec::with_capacity(prompt.len() + 1);
+    let prompt_tokens = tokenizer.encode_text(prompt);
+    run_gpu_completion_from_prompt_tokens(
+        runtime,
+        matrices,
+        model,
+        tokenizer,
+        &prompt_tokens,
+        max_new_tokens,
+        strategy,
+        stop_condition,
+        rng,
+        profile,
+    )
+}
+
+pub(super) fn run_gpu_completion_from_tokens(
+    runtime: &GpuRuntime,
+    matrices: &HashMap<ParameterId, GpuMatrix>,
+    model: &Model,
+    tokenizer: &Tokenizer,
+    prompt_tokens: &[usize],
+    max_new_tokens: usize,
+    strategy: &SamplingStrategy,
+    stop_condition: &StopCondition,
+    rng: &mut Rng,
+    profile: Option<&RuntimeProfile>,
+) -> Result<String> {
+    strategy.validate()?;
+    run_gpu_completion_from_prompt_tokens(
+        runtime,
+        matrices,
+        model,
+        tokenizer,
+        prompt_tokens,
+        max_new_tokens,
+        strategy,
+        stop_condition,
+        rng,
+        profile,
+    )
+}
+
+fn run_gpu_completion_from_prompt_tokens(
+    runtime: &GpuRuntime,
+    matrices: &HashMap<ParameterId, GpuMatrix>,
+    model: &Model,
+    tokenizer: &Tokenizer,
+    prompt_tokens: &[usize],
+    max_new_tokens: usize,
+    strategy: &SamplingStrategy,
+    stop_condition: &StopCondition,
+    rng: &mut Rng,
+    profile: Option<&RuntimeProfile>,
+) -> Result<String> {
+    let mut conditioning = Vec::with_capacity(prompt_tokens.len() + 1);
     conditioning.push(tokenizer.bos_id());
-    conditioning.extend(tokenizer.encode_text(prompt));
+    conditioning.extend_from_slice(prompt_tokens);
 
     let reserve = max_new_tokens.min(model.cfg.block_size.saturating_sub(1));
     let max_prompt_tokens = usize::max(1, model.cfg.block_size.saturating_sub(reserve));
     if conditioning.len() > max_prompt_tokens {
         conditioning = conditioning[conditioning.len() - max_prompt_tokens..].to_vec();
+    }
+    let mut seen_token_counts = HashMap::new();
+    for token_id in &conditioning {
+        *seen_token_counts.entry(*token_id).or_insert(0_usize) += 1;
     }
 
     let mut layer_caches = (0..model.cfg.n_layer)
@@ -183,32 +298,21 @@ pub(super) fn run_gpu_completion(
     let mut generated_tokens = Vec::with_capacity(max_steps);
 
     for _ in 0..max_steps {
-        let scaled = measure(profile, "sample.scale_logits", || {
-            logits
-                .iter()
-                .map(|value| value / temperature)
-                .collect::<Vec<_>>()
-        });
-        let probs = measure(profile, "sample.softmax", || {
-            crate::core::tensor::softmax(&scaled)
-        });
-        let next_token = rng.sample_weighted(&probs).ok_or_else(|| {
-            RustGptError::Tensor("sampling failed because probabilities were invalid".to_string())
+        let next_token = measure(profile, "sample.filter_logits", || {
+            select_next_token(&logits, strategy, &seen_token_counts, rng)
         })?;
 
-        match tokenizer.symbol(next_token)? {
-            TokenSymbol::Byte(_) => generated_tokens.push(next_token),
-            TokenSymbol::Bos | TokenSymbol::Eos => break,
+        if tokenizer.is_end_token(next_token) {
+            break;
         }
+        generated_tokens.push(next_token);
+        *seen_token_counts.entry(next_token).or_insert(0_usize) += 1;
 
-        let generated = tokenizer.decode(&generated_tokens, true)?;
-        if let Some(stop) = stop_sequences
-            .iter()
-            .find(|stop| generated.ends_with(**stop))
-            .copied()
-        {
-            let new_len = generated.len().saturating_sub(stop.len());
-            return Ok(generated[..new_len].to_string());
+        if let Some(stop_len) = stop_condition.matched_suffix_len(&generated_tokens) {
+            return tokenizer.decode(
+                &generated_tokens[..generated_tokens.len().saturating_sub(stop_len)],
+                true,
+            );
         }
 
         pos_id += 1;

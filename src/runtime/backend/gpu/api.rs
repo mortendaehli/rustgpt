@@ -5,19 +5,21 @@
 use std::collections::HashMap;
 
 use crate::app::cli::GpuInfoCommand;
-use crate::core::config::DeviceKind;
+use crate::core::config::{ActivationKind, DeviceKind};
 use crate::core::error::{Result, RustGptError};
 use crate::core::rng::Rng;
 use crate::core::tensor::{
-    Matrix, accumulate_linear_grad, add_in_place, linear, linear_transposed, relu_backward,
-    rmsnorm_backward,
+    Matrix, accumulate_linear_grad, add_in_place, gelu_backward, linear, linear_transposed,
+    relu_backward, rmsnorm_backward, swiglu_backward,
 };
 use crate::data::tokenizer::Tokenizer;
+use crate::data::training_data::SequenceExample;
 use crate::model::{Model, ParameterId};
 use crate::runtime::profile::RuntimeProfile;
+use crate::runtime::sampling::{SamplingStrategy, StopCondition};
 use crate::runtime::train_cache::SequenceForwardCache;
 
-use super::inference::run_gpu_completion;
+use super::inference::{run_gpu_completion, run_gpu_completion_from_tokens};
 use super::shaders::AdapterSummary;
 use super::training::{
     accumulate_gpu_training_batch, backward_gpu_training_sequence, run_gpu_training_sequence,
@@ -114,7 +116,7 @@ impl ComputeBackend {
     pub fn forward_training_sequence(
         &self,
         model: &Model,
-        tokens: &[usize],
+        example: &SequenceExample,
         capture_loss: bool,
         grad_scale: f32,
         profile: Option<&RuntimeProfile>,
@@ -127,7 +129,7 @@ impl ComputeBackend {
                 runtime,
                 matrices,
                 model,
-                tokens,
+                example,
                 capture_loss,
                 grad_scale,
                 profile,
@@ -168,7 +170,7 @@ impl ComputeBackend {
     pub fn accumulate_training_batch(
         &self,
         model: &Model,
-        batch_tokens: &[Vec<usize>],
+        batch_examples: &[SequenceExample],
         capture_loss: bool,
         grad_scale: f32,
         profile: Option<&RuntimeProfile>,
@@ -181,7 +183,7 @@ impl ComputeBackend {
                 runtime,
                 matrices,
                 model,
-                batch_tokens,
+                batch_examples,
                 capture_loss,
                 grad_scale,
                 profile,
@@ -212,11 +214,19 @@ impl ComputeBackend {
         beta1: f32,
         beta2: f32,
         eps_adam: f32,
+        weight_decay: f32,
         optimizer_step_num: usize,
     ) -> Result<()> {
         match &mut self.kind {
             ComputeBackendKind::Cpu => {
-                model.adam_step(lr_t, beta1, beta2, eps_adam, optimizer_step_num);
+                model.adam_step(
+                    lr_t,
+                    beta1,
+                    beta2,
+                    eps_adam,
+                    weight_decay,
+                    optimizer_step_num,
+                );
                 Ok(())
             }
             ComputeBackendKind::Gpu {
@@ -239,11 +249,64 @@ impl ComputeBackend {
                         beta1,
                         beta2,
                         eps_adam,
+                        weight_decay,
                         optimizer_step_num,
                     )?;
                     matrix.grad.fill(0.0);
                     Ok(())
                 })
+            }
+        }
+    }
+
+    pub fn clip_gradients(&mut self, model: &mut Model, max_norm: f32) -> Result<Option<f32>> {
+        if max_norm <= 0.0 {
+            return Ok(None);
+        }
+
+        match &mut self.kind {
+            ComputeBackendKind::Cpu => {
+                let grad_norm = model.grad_squared_sum().sqrt();
+                if grad_norm > max_norm {
+                    model.scale_gradients(max_norm / grad_norm);
+                }
+                Ok(Some(grad_norm))
+            }
+            ComputeBackendKind::Gpu {
+                runtime, matrices, ..
+            } => {
+                let mut sum_sq = 0.0;
+                model.visit_parameters_mut(|parameter_id, _matrix| {
+                    let gpu_matrix = matrices.get(&parameter_id).ok_or_else(|| {
+                        RustGptError::Gpu(format!(
+                            "GPU state missing for parameter {}",
+                            parameter_id.label()
+                        ))
+                    })?;
+                    let grad = runtime.download_gradients(gpu_matrix)?;
+                    sum_sq += grad.iter().map(|value| value * value).sum::<f32>();
+                    Ok::<(), RustGptError>(())
+                })?;
+                let grad_norm = sum_sq.sqrt();
+                if grad_norm > max_norm {
+                    let scale = max_norm / grad_norm;
+                    model.visit_parameters_mut(|parameter_id, matrix| {
+                        let gpu_matrix = matrices.get(&parameter_id).ok_or_else(|| {
+                            RustGptError::Gpu(format!(
+                                "GPU state missing for parameter {}",
+                                parameter_id.label()
+                            ))
+                        })?;
+                        let mut grad = runtime.download_gradients(gpu_matrix)?;
+                        for value in &mut grad {
+                            *value *= scale;
+                        }
+                        runtime.upload_gradients(gpu_matrix, &grad)?;
+                        matrix.grad.fill(0.0);
+                        Ok::<(), RustGptError>(())
+                    })?;
+                }
+                Ok(Some(grad_norm))
             }
         }
     }
@@ -332,22 +395,56 @@ impl ComputeBackend {
 
     pub fn backward_mlp_residual(
         &self,
+        activation: ActivationKind,
         x_residual: &[f32],
         x_norm: &[f32],
         rms_inv: f32,
         mlp_hidden_pre: &[f32],
+        mlp_gate_pre: Option<&[f32]>,
         mlp_hidden_act: &[f32],
         d_mlp_out: &[f32],
         mlp_fc1: &mut Matrix,
+        mlp_fc_gate: Option<&mut Matrix>,
         mlp_fc2: &mut Matrix,
     ) -> Result<Vec<f32>> {
         match &self.kind {
             ComputeBackendKind::Cpu => {
                 let d_mlp_hidden_act = linear_transposed(d_mlp_out, mlp_fc2)?;
                 accumulate_linear_grad(mlp_hidden_act, d_mlp_out, mlp_fc2)?;
-                let d_mlp_hidden_pre = relu_backward(mlp_hidden_pre, &d_mlp_hidden_act);
-                let d_x_norm_mlp = linear_transposed(&d_mlp_hidden_pre, mlp_fc1)?;
-                accumulate_linear_grad(x_norm, &d_mlp_hidden_pre, mlp_fc1)?;
+                let d_x_norm_mlp = match activation {
+                    ActivationKind::Relu => relu_backward(mlp_hidden_pre, &d_mlp_hidden_act),
+                    ActivationKind::Gelu => gelu_backward(mlp_hidden_pre, &d_mlp_hidden_act),
+                    ActivationKind::SwiGlu => {
+                        let gate_pre = mlp_gate_pre.ok_or_else(|| {
+                            RustGptError::Tensor(
+                                "swiglu backward requires cached gate pre-activations".to_string(),
+                            )
+                        })?;
+                        let gate_matrix = mlp_fc_gate.ok_or_else(|| {
+                            RustGptError::Tensor(
+                                "swiglu backward requires gate weights".to_string(),
+                            )
+                        })?;
+                        let (d_value, d_gate) =
+                            swiglu_backward(mlp_hidden_pre, gate_pre, &d_mlp_hidden_act)?;
+                        let mut d_x_norm = linear_transposed(&d_value, mlp_fc1)?;
+                        accumulate_linear_grad(x_norm, &d_value, mlp_fc1)?;
+                        let d_x_norm_gate = linear_transposed(&d_gate, gate_matrix)?;
+                        accumulate_linear_grad(x_norm, &d_gate, gate_matrix)?;
+                        add_in_place(&mut d_x_norm, &d_x_norm_gate);
+                        d_x_norm
+                    }
+                };
+                if activation != ActivationKind::SwiGlu {
+                    let d_mlp_hidden_pre = match activation {
+                        ActivationKind::Relu => relu_backward(mlp_hidden_pre, &d_mlp_hidden_act),
+                        ActivationKind::Gelu => gelu_backward(mlp_hidden_pre, &d_mlp_hidden_act),
+                        ActivationKind::SwiGlu => unreachable!(),
+                    };
+                    let d_x_norm_mlp = linear_transposed(&d_mlp_hidden_pre, mlp_fc1)?;
+                    accumulate_linear_grad(x_norm, &d_mlp_hidden_pre, mlp_fc1)?;
+                    return Ok(rmsnorm_backward(x_residual, rms_inv, &d_x_norm_mlp));
+                }
                 Ok(rmsnorm_backward(x_residual, rms_inv, &d_x_norm_mlp))
             }
             ComputeBackendKind::Gpu {
@@ -356,15 +453,23 @@ impl ComputeBackend {
                 matrix_index,
             } => {
                 let gpu_fc1 = runtime.lookup_matrix(matrices, matrix_index, mlp_fc1)?;
+                let gpu_fc_gate = if let Some(mlp_fc_gate) = mlp_fc_gate {
+                    Some(runtime.lookup_matrix(matrices, matrix_index, mlp_fc_gate)?)
+                } else {
+                    None
+                };
                 let gpu_fc2 = runtime.lookup_matrix(matrices, matrix_index, mlp_fc2)?;
                 runtime.backward_mlp_residual(
+                    activation,
                     x_residual,
                     x_norm,
                     rms_inv,
                     mlp_hidden_pre,
+                    mlp_gate_pre,
                     mlp_hidden_act,
                     d_mlp_out,
                     gpu_fc1,
+                    gpu_fc_gate,
                     gpu_fc2,
                 )
             }
@@ -417,8 +522,8 @@ impl ComputeBackend {
         tokenizer: &Tokenizer,
         prompt: &str,
         max_new_tokens: usize,
-        temperature: f32,
-        stop_sequences: &[&str],
+        strategy: &SamplingStrategy,
+        stop_condition: &StopCondition,
         rng: &mut Rng,
         profile: Option<&RuntimeProfile>,
     ) -> Result<Option<String>> {
@@ -433,8 +538,39 @@ impl ComputeBackend {
                 tokenizer,
                 prompt,
                 max_new_tokens,
-                temperature,
-                stop_sequences,
+                strategy,
+                stop_condition,
+                rng,
+                profile,
+            )
+            .map(Some),
+        }
+    }
+
+    pub fn generate_completion_from_tokens_on_device(
+        &self,
+        model: &Model,
+        tokenizer: &Tokenizer,
+        prompt_tokens: &[usize],
+        max_new_tokens: usize,
+        strategy: &SamplingStrategy,
+        stop_condition: &StopCondition,
+        rng: &mut Rng,
+        profile: Option<&RuntimeProfile>,
+    ) -> Result<Option<String>> {
+        match &self.kind {
+            ComputeBackendKind::Cpu => Ok(None),
+            ComputeBackendKind::Gpu {
+                runtime, matrices, ..
+            } => run_gpu_completion_from_tokens(
+                runtime,
+                matrices,
+                model,
+                tokenizer,
+                prompt_tokens,
+                max_new_tokens,
+                strategy,
+                stop_condition,
                 rng,
                 profile,
             )

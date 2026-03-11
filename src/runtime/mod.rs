@@ -5,6 +5,7 @@
 pub mod backend;
 pub mod backward;
 pub mod chat;
+pub mod eval;
 pub mod forward;
 pub mod profile;
 pub mod sampling;

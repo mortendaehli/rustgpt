@@ -6,13 +6,25 @@ use crate::core::rng::Rng;
 use crate::data::checkpoint::load_checkpoint;
 use crate::runtime::backend::ComputeBackend;
 use crate::runtime::chat::{ChatDirective, ChatSession, parse_chat_directive};
-use crate::runtime::sampling::generate_completion_with_backend;
+use crate::runtime::sampling::{
+    SamplingStrategy, generate_completion_from_tokens_streaming_with_backend,
+    generate_completion_from_tokens_with_backend,
+};
 
 pub fn run_chat(command: ChatCommand) -> Result<()> {
     let checkpoint = load_checkpoint(&command.checkpoint)?;
     let backend = ComputeBackend::from_model(&checkpoint.model, command.chat.device)?;
     let mut rng = Rng::from_seed(command.chat.seed);
-    let mut session = ChatSession::new(command.chat.system_prompt.clone());
+    let mut session =
+        ChatSession::new(checkpoint.chat_template, command.chat.system_prompt.clone());
+    let strategy = SamplingStrategy {
+        temperature: command.chat.temperature,
+        top_k: command.chat.top_k,
+        top_p: command.chat.top_p,
+        repetition_penalty: command.chat.repetition_penalty,
+        presence_penalty: command.chat.presence_penalty,
+        frequency_penalty: command.chat.frequency_penalty,
+    };
 
     println!(
         "RustGPT chat  checkpoint={}  trained_steps={}  context={}  max_new_tokens={}  backend={}",
@@ -47,18 +59,53 @@ pub fn run_chat(command: ChatCommand) -> Result<()> {
         }
 
         session.push_user_turn(&input);
-        let reply = generate_completion_with_backend(
-            &checkpoint.model,
-            &backend,
+        let prepared_prompt = session.prepare_prompt(
             &checkpoint.tokenizer,
-            &session.prompt(),
+            checkpoint.model.cfg.block_size,
             command.chat.max_new_tokens,
-            command.chat.temperature,
-            session.stop_sequences(),
-            None,
-            &mut rng,
         )?;
-        println!("assistant> {}", reply);
+        if prepared_prompt.dropped_turns > 0 {
+            println!(
+                "note: dropped {} old turn(s) to fit the context window",
+                prepared_prompt.dropped_turns
+            );
+        }
+        let reply = if command.chat.stream {
+            print!("assistant> ");
+            io::stdout().flush()?;
+            let mut stream_stdout = |delta: &str| {
+                print!("{delta}");
+                let _ = io::stdout().flush();
+            };
+            let reply = generate_completion_from_tokens_streaming_with_backend(
+                &checkpoint.model,
+                &backend,
+                &checkpoint.tokenizer,
+                &prepared_prompt.prompt_tokens,
+                command.chat.max_new_tokens,
+                &strategy,
+                &prepared_prompt.stop_condition,
+                None,
+                &mut rng,
+                &mut stream_stdout,
+            )?;
+            println!();
+            reply
+        } else {
+            let reply = generate_completion_from_tokens_with_backend(
+                &checkpoint.model,
+                &backend,
+                &checkpoint.tokenizer,
+                &prepared_prompt.prompt_tokens,
+                command.chat.max_new_tokens,
+                &strategy,
+                &prepared_prompt.stop_condition,
+                None,
+                &mut rng,
+            )?;
+            println!("assistant> {}", reply);
+            reply
+        };
         session.push_assistant_turn(&reply);
     }
 

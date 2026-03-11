@@ -4,5 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+arrow-array = "54"
+arrow-schema = "54"
+parquet = { version = "54", features = ["json"] }
 pollster = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = "0.20"
 wgpu = "0.20"

@@ -1,5 +1,10 @@
+use crate::core::config::{ActivationKind, PositionEncodingKind};
 use crate::core::error::Result;
+use crate::core::tensor::swiglu;
+use crate::data::training_data::SequenceExample;
 use crate::model::Model;
+use crate::model::attention::expand_grouped_heads;
+use crate::model::position::apply_qk_position_encoding_in_place;
 use crate::runtime::backend::ComputeBackend;
 use crate::runtime::profile::RuntimeProfile;
 use crate::runtime::train_cache::{LayerForwardCache, SequenceForwardCache, TokenForwardCache};
@@ -24,59 +29,65 @@ pub fn forward_sequence_profiled(
     backend: &ComputeBackend,
     profile: Option<&RuntimeProfile>,
 ) -> Result<SequenceForwardCache> {
-    forward_sequence_profiled_with_loss(model, tokens, backend, profile, true, 1.0)
+    let example = full_loss_example(tokens)?;
+    forward_example_profiled_with_loss(model, &example, backend, profile, true, 1.0)
 }
 
-pub fn forward_sequence_profiled_with_loss(
+pub fn forward_example_profiled_with_loss(
     model: &Model,
-    tokens: &[usize],
+    example: &SequenceExample,
     backend: &ComputeBackend,
     profile: Option<&RuntimeProfile>,
     capture_loss: bool,
     grad_scale: f32,
 ) -> Result<SequenceForwardCache> {
     if let Some(cache) =
-        backend.forward_training_sequence(model, tokens, capture_loss, grad_scale, profile)?
+        backend.forward_training_sequence(model, example, capture_loss, grad_scale, profile)?
     {
         return Ok(cache);
     }
 
-    if tokens.len() < 2 {
+    if example.input_ids.is_empty() {
         return Err(crate::core::error::RustGptError::Data(
             "need at least two tokens to compute a next-token loss".to_string(),
         ));
     }
 
-    let n_pred = usize::min(model.cfg.block_size, tokens.len() - 1);
+    let n_pred = usize::min(model.cfg.block_size, example.input_ids.len());
     let mut token_caches = Vec::with_capacity(n_pred);
     let mut total_loss = 0.0;
+    let mut loss_weight_sum = 0.0;
     let mut kv_cache = new_kv_cache(model.cfg.n_layer, model.cfg.n_embd);
 
     for pos_id in 0..n_pred {
-        let token_id = tokens[pos_id];
-        let target_id = tokens[pos_id + 1];
+        let token_id = example.input_ids[pos_id];
+        let target_id = example.target_ids[pos_id];
+        let loss_weight = example.loss_mask[pos_id];
         let cache = forward_token_with_existing_cache(
             model,
             token_id,
             target_id,
             pos_id,
+            loss_weight,
             &mut kv_cache,
             backend,
             profile,
         )?;
-        if capture_loss {
-            total_loss += -cache.probs[target_id].ln();
+        if capture_loss && loss_weight > 0.0 {
+            total_loss += -cache.probs[target_id].ln() * loss_weight;
+            loss_weight_sum += loss_weight;
         }
         token_caches.push(cache);
     }
 
     Ok(SequenceForwardCache {
         tokens: token_caches,
-        mean_loss: if capture_loss {
-            total_loss / n_pred as f32
+        mean_loss: if capture_loss && loss_weight_sum > 0.0 {
+            total_loss / loss_weight_sum
         } else {
             0.0
         },
+        loss_weight_sum,
         grad_scale,
         device_sequence: None,
     })
@@ -94,7 +105,7 @@ pub fn forward_token(
     kv_cache: &mut KvCache,
 ) -> Result<TokenForwardCache> {
     let backend = ComputeBackend::cpu();
-    forward_token_with_backend(model, token_id, target_id, pos_id, kv_cache, &backend)
+    forward_token_with_backend(model, token_id, target_id, pos_id, 1.0, kv_cache, &backend)
 }
 
 pub fn forward_token_with_backend(
@@ -102,10 +113,20 @@ pub fn forward_token_with_backend(
     token_id: usize,
     target_id: usize,
     pos_id: usize,
+    loss_weight: f32,
     kv_cache: &mut KvCache,
     backend: &ComputeBackend,
 ) -> Result<TokenForwardCache> {
-    forward_token_profiled(model, token_id, target_id, pos_id, kv_cache, backend, None)
+    forward_token_profiled(
+        model,
+        token_id,
+        target_id,
+        pos_id,
+        loss_weight,
+        kv_cache,
+        backend,
+        None,
+    )
 }
 
 pub fn forward_token_profiled(
@@ -113,12 +134,20 @@ pub fn forward_token_profiled(
     token_id: usize,
     target_id: usize,
     pos_id: usize,
+    loss_weight: f32,
     kv_cache: &mut KvCache,
     backend: &ComputeBackend,
     profile: Option<&RuntimeProfile>,
 ) -> Result<TokenForwardCache> {
     forward_token_with_existing_cache(
-        model, token_id, target_id, pos_id, kv_cache, backend, profile,
+        model,
+        token_id,
+        target_id,
+        pos_id,
+        loss_weight,
+        kv_cache,
+        backend,
+        profile,
     )
 }
 
@@ -127,12 +156,13 @@ fn forward_token_with_existing_cache(
     token_id: usize,
     target_id: usize,
     pos_id: usize,
+    loss_weight: f32,
     kv_cache: &mut KvCache,
     backend: &ComputeBackend,
     profile: Option<&RuntimeProfile>,
 ) -> Result<TokenForwardCache> {
     use crate::core::error::RustGptError;
-    use crate::core::tensor::{add_in_place, relu, rmsnorm, softmax};
+    use crate::core::tensor::{add_in_place, gelu, relu, rmsnorm, softmax};
     use crate::runtime::profile::measure;
     use crate::runtime::workspace::AttentionWeights;
 
@@ -156,13 +186,22 @@ fn forward_token_with_existing_cache(
     }
 
     let embed_sum = measure(profile, "forward.embed_add", || {
-        model
-            .wte
-            .row(token_id)
-            .iter()
-            .zip(model.wpe.row(pos_id))
-            .map(|(a, b)| a + b)
-            .collect::<Vec<_>>()
+        match model.cfg.position_encoding {
+            PositionEncodingKind::LearnedAbsolute => {
+                let pos_row = model
+                    .position_embedding()
+                    .expect("learned position encoding requires wpe")
+                    .row(pos_id);
+                model
+                    .wte
+                    .row(token_id)
+                    .iter()
+                    .zip(pos_row)
+                    .map(|(a, b)| a + b)
+                    .collect::<Vec<_>>()
+            }
+            PositionEncodingKind::Rope => model.wte.row(token_id).to_vec(),
+        }
     });
     let (mut x, embed_rms_inv) = measure(profile, "forward.rmsnorm", || rmsnorm(&embed_sum));
     let mut layer_caches = Vec::with_capacity(model.cfg.n_layer);
@@ -171,14 +210,46 @@ fn forward_token_with_existing_cache(
         let x_residual_attn = x.clone();
         let (x_norm_attn, rms_inv_attn) = measure(profile, "forward.rmsnorm", || rmsnorm(&x));
 
-        let q = measure(profile, "forward.matvec", || {
+        let mut q = measure(profile, "forward.matvec", || {
             backend.matvec(&x_norm_attn, &layer.attn_wq)
         })?;
-        let k = measure(profile, "forward.matvec", || {
+        let mut k_compact = measure(profile, "forward.matvec", || {
             backend.matvec(&x_norm_attn, &layer.attn_wk)
         })?;
-        let v = measure(profile, "forward.matvec", || {
+        let v_compact = measure(profile, "forward.matvec", || {
             backend.matvec(&x_norm_attn, &layer.attn_wv)
+        })?;
+        measure(profile, "forward.position", || {
+            apply_qk_position_encoding_in_place(
+                &mut q,
+                model.cfg.position_encoding,
+                pos_id,
+                model.cfg.n_head,
+                model.head_dim(),
+            );
+            apply_qk_position_encoding_in_place(
+                &mut k_compact,
+                model.cfg.position_encoding,
+                pos_id,
+                model.cfg.n_kv_head,
+                model.head_dim(),
+            );
+        });
+        let k = measure(profile, "forward.attention_expand", || {
+            expand_grouped_heads(
+                &k_compact,
+                model.cfg.n_head,
+                model.cfg.n_kv_head,
+                model.head_dim(),
+            )
+        })?;
+        let v = measure(profile, "forward.attention_expand", || {
+            expand_grouped_heads(
+                &v_compact,
+                model.cfg.n_head,
+                model.cfg.n_kv_head,
+                model.head_dim(),
+            )
         })?;
         kv_cache[layer_idx].push(&k, &v)?;
 
@@ -231,7 +302,30 @@ fn forward_token_with_existing_cache(
         let mlp_hidden_pre = measure(profile, "forward.matvec", || {
             backend.matvec(&x_norm_mlp, &layer.mlp_fc1)
         })?;
-        let mlp_hidden_act = measure(profile, "forward.relu", || relu(&mlp_hidden_pre));
+        let mlp_gate_pre = if model.cfg.activation == ActivationKind::SwiGlu {
+            let gate = layer
+                .mlp_fc_gate
+                .as_ref()
+                .expect("swiglu activation requires mlp_fc_gate");
+            Some(measure(profile, "forward.matvec", || {
+                backend.matvec(&x_norm_mlp, gate)
+            })?)
+        } else {
+            None
+        };
+        let mlp_hidden_act = measure(profile, "forward.activation", || {
+            match model.cfg.activation {
+                ActivationKind::Relu => relu(&mlp_hidden_pre),
+                ActivationKind::Gelu => gelu(&mlp_hidden_pre),
+                ActivationKind::SwiGlu => swiglu(
+                    &mlp_hidden_pre,
+                    mlp_gate_pre
+                        .as_ref()
+                        .expect("swiglu activation requires gate pre-activations"),
+                )
+                .expect("swiglu forward shapes must match"),
+            }
+        });
         x = measure(profile, "forward.matvec", || {
             backend.matvec(&mlp_hidden_act, &layer.mlp_fc2)
         })?;
@@ -250,13 +344,15 @@ fn forward_token_with_existing_cache(
             x_norm_mlp,
             rms_inv_mlp,
             mlp_hidden_pre,
+            mlp_gate_pre,
             mlp_hidden_act,
         });
     }
 
     let final_x = x.clone();
+    let (final_norm_x, final_rms_inv) = measure(profile, "forward.rmsnorm", || rmsnorm(&x));
     let logits = measure(profile, "forward.matvec", || {
-        backend.matvec(&x, &model.lm_head)
+        backend.matvec(&final_norm_x, model.output_projection())
     })?;
     let probs = measure(profile, "forward.softmax", || softmax(&logits));
 
@@ -264,18 +360,34 @@ fn forward_token_with_existing_cache(
         token_id,
         target_id,
         pos_id,
+        loss_weight,
         embed_sum,
         embed_rms_inv,
         layers: layer_caches,
         final_x,
+        final_norm_x,
+        final_rms_inv,
         logits,
         probs,
     })
 }
 
+fn full_loss_example(tokens: &[usize]) -> Result<SequenceExample> {
+    if tokens.len() < 2 {
+        return Err(crate::core::error::RustGptError::Data(
+            "need at least two tokens to compute a next-token loss".to_string(),
+        ));
+    }
+    Ok(SequenceExample {
+        input_ids: tokens[..tokens.len() - 1].to_vec(),
+        target_ids: tokens[1..].to_vec(),
+        loss_mask: vec![1.0; tokens.len() - 1],
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::core::config::{BoundaryMode, ModelConfig};
+    use crate::core::config::{ActivationKind, BoundaryMode, ModelConfig, PositionEncodingKind};
     use crate::core::rng::Rng;
     use crate::data::tokenizer::Tokenizer;
     use crate::model::Model;
@@ -294,6 +406,10 @@ mod tests {
             n_layer: 1,
             n_embd: 16,
             n_head: 4,
+            n_kv_head: 4,
+            tie_embeddings: false,
+            activation: ActivationKind::Relu,
+            position_encoding: PositionEncodingKind::LearnedAbsolute,
             boundary_mode: BoundaryMode::SharedBos,
         };
         let mut rng = Rng::from_seed(42);
@@ -322,6 +438,10 @@ mod tests {
             n_layer: 1,
             n_embd: 16,
             n_head: 4,
+            n_kv_head: 4,
+            tie_embeddings: false,
+            activation: ActivationKind::Relu,
+            position_encoding: PositionEncodingKind::LearnedAbsolute,
             boundary_mode: BoundaryMode::SharedBos,
         };
         let mut rng = Rng::from_seed(42);
@@ -341,6 +461,10 @@ mod tests {
             n_layer: 1,
             n_embd: 16,
             n_head: 4,
+            n_kv_head: 4,
+            tie_embeddings: false,
+            activation: ActivationKind::Relu,
+            position_encoding: PositionEncodingKind::LearnedAbsolute,
             boundary_mode: BoundaryMode::SharedBos,
         };
         let mut rng = Rng::from_seed(7);
@@ -361,6 +485,10 @@ mod tests {
             n_layer: 1,
             n_embd: 16,
             n_head: 4,
+            n_kv_head: 4,
+            tie_embeddings: false,
+            activation: ActivationKind::Relu,
+            position_encoding: PositionEncodingKind::LearnedAbsolute,
             boundary_mode: BoundaryMode::SharedBos,
         };
         let mut rng = Rng::from_seed(42);
@@ -370,5 +498,99 @@ mod tests {
         let backend = crate::runtime::backend::ComputeBackend::cpu();
         let backend_forward = forward_sequence_with_backend(&model, &tokens, &backend).unwrap();
         assert!((cpu.mean_loss - backend_forward.mean_loss).abs() < 1e-6);
+    }
+
+    #[test]
+    fn forward_sequence_supports_gelu_activation() {
+        let docs = vec!["naomi".to_string()];
+        let tokenizer = Tokenizer::from_docs(&docs, BoundaryMode::SharedBos).unwrap();
+        let cfg = ModelConfig {
+            vocab_size: tokenizer.vocab_size(),
+            block_size: 16,
+            n_layer: 1,
+            n_embd: 16,
+            n_head: 4,
+            n_kv_head: 4,
+            tie_embeddings: false,
+            activation: ActivationKind::Gelu,
+            position_encoding: PositionEncodingKind::LearnedAbsolute,
+            boundary_mode: BoundaryMode::SharedBos,
+        };
+        let mut rng = Rng::from_seed(21);
+        let model = Model::new(cfg, &mut rng).unwrap();
+        let tokens = tokenizer.encode_with_boundaries("naomi").unwrap();
+        let sequence = forward_sequence(&model, &tokens).unwrap();
+        assert!(sequence.mean_loss.is_finite());
+        assert_eq!(sequence.tokens.len(), tokens.len() - 1);
+    }
+
+    #[test]
+    fn forward_sequence_supports_swiglu_activation() {
+        let docs = vec!["naomi".to_string()];
+        let tokenizer = Tokenizer::from_docs(&docs, BoundaryMode::SharedBos).unwrap();
+        let cfg = ModelConfig {
+            vocab_size: tokenizer.vocab_size(),
+            block_size: 16,
+            n_layer: 1,
+            n_embd: 16,
+            n_head: 4,
+            n_kv_head: 4,
+            tie_embeddings: false,
+            activation: ActivationKind::SwiGlu,
+            position_encoding: PositionEncodingKind::LearnedAbsolute,
+            boundary_mode: BoundaryMode::SharedBos,
+        };
+        let mut rng = Rng::from_seed(23);
+        let model = Model::new(cfg, &mut rng).unwrap();
+        let tokens = tokenizer.encode_with_boundaries("naomi").unwrap();
+        let sequence = forward_sequence(&model, &tokens).unwrap();
+        assert!(sequence.mean_loss.is_finite());
+    }
+
+    #[test]
+    fn forward_sequence_supports_grouped_query_attention() {
+        let docs = vec!["naomi".to_string()];
+        let tokenizer = Tokenizer::from_docs(&docs, BoundaryMode::SharedBos).unwrap();
+        let cfg = ModelConfig {
+            vocab_size: tokenizer.vocab_size(),
+            block_size: 16,
+            n_layer: 1,
+            n_embd: 16,
+            n_head: 4,
+            n_kv_head: 2,
+            tie_embeddings: false,
+            activation: ActivationKind::Relu,
+            position_encoding: PositionEncodingKind::Rope,
+            boundary_mode: BoundaryMode::SharedBos,
+        };
+        let mut rng = Rng::from_seed(24);
+        let model = Model::new(cfg, &mut rng).unwrap();
+        let tokens = tokenizer.encode_with_boundaries("naomi").unwrap();
+        let sequence = forward_sequence(&model, &tokens).unwrap();
+        assert!(sequence.mean_loss.is_finite());
+    }
+
+    #[test]
+    fn forward_sequence_supports_rope_positions() {
+        let docs = vec!["naomi".to_string()];
+        let tokenizer = Tokenizer::from_docs(&docs, BoundaryMode::SharedBos).unwrap();
+        let cfg = ModelConfig {
+            vocab_size: tokenizer.vocab_size(),
+            block_size: 16,
+            n_layer: 1,
+            n_embd: 16,
+            n_head: 4,
+            n_kv_head: 4,
+            tie_embeddings: false,
+            activation: ActivationKind::Relu,
+            position_encoding: PositionEncodingKind::Rope,
+            boundary_mode: BoundaryMode::SharedBos,
+        };
+        let mut rng = Rng::from_seed(22);
+        let model = Model::new(cfg, &mut rng).unwrap();
+        let tokens = tokenizer.encode_with_boundaries("naomi").unwrap();
+        let sequence = forward_sequence(&model, &tokens).unwrap();
+        assert!(sequence.mean_loss.is_finite());
+        assert_eq!(sequence.tokens.len(), tokens.len() - 1);
     }
 }

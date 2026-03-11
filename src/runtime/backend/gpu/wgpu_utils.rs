@@ -346,9 +346,10 @@ pub(super) fn create_loss_bind_group_layout(device: &wgpu::Device) -> wgpu::Bind
         entries: &[
             storage_layout_entry(0, true),
             storage_layout_entry(1, true),
-            storage_layout_entry(2, false),
+            storage_layout_entry(2, true),
             storage_layout_entry(3, false),
-            uniform_layout_entry(4),
+            storage_layout_entry(4, false),
+            uniform_layout_entry(5),
         ],
     })
 }

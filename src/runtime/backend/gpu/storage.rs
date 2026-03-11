@@ -24,6 +24,7 @@ pub(super) struct GpuTrainingSequenceCache {
     pub(super) token_ids: GpuIndexVector,
     pub(super) embed_sum: GpuVector,
     pub(super) final_x: GpuVector,
+    pub(super) final_norm_x: GpuVector,
     pub(super) d_logits: GpuVector,
     pub(super) layers: Vec<GpuTrainingLayerCache>,
 }
@@ -39,6 +40,7 @@ pub(super) struct GpuTrainingLayerCache {
     pub(super) x_residual_mlp: GpuVector,
     pub(super) x_norm_mlp: GpuVector,
     pub(super) mlp_hidden_pre: GpuVector,
+    pub(super) mlp_gate_pre: Option<GpuVector>,
     pub(super) mlp_hidden_act: GpuVector,
 }
 
